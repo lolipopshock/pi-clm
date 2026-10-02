@@ -870,6 +870,77 @@ describe("live-context extension lifecycle", () => {
 });
 
 describe("pi-clm entry point", () => {
+	for (const mode of ["mixed", "all-stale"]) {
+		void test(`CLM ${mode} mirror edit preserves raw input and delivers a truthful stale-header notice on the next context`, async () => {
+			const harness = createHarness();
+			clmExtension(harness.pi);
+			await emit(harness, "session_start", { reason: "startup" });
+			try {
+				const before = await emit(harness, "before_agent_start", { systemPrompt: "base" });
+				const pathMatch = String(before[0].systemPrompt).match(/mirrored at `([^`]+)`/);
+				assert.ok(pathMatch, "CLM guidance supplies the real mirror path");
+				const path = pathMatch[1];
+				const raw: LiveContextMessage[] = [
+					{ role: "user", content: "Keep the task.", timestamp: 1 },
+					{ role: "assistant", content: "Current body.", timestamp: 2 },
+					{ role: "assistant", content: "Stale body.", timestamp: 3 },
+				];
+				await emit(harness, "context", { messages: raw });
+				const original = await readFile(path, "utf8");
+				const headers = original.match(/^\[\[CTX_TURN [^\n]+\]\]$/gm);
+				assert.ok(headers, "disk mirror contains current block headers");
+				assert.equal(headers.length, 3);
+				const staleHeaders = headers.map((header) => header.replace(/document=[a-f0-9]+ /, "document=00000000deadbeef "));
+				const edited = mode === "mixed"
+					? original.replace(headers[2], staleHeaders[2])
+					: original.replace(/^\[\[CTX_TURN [^\n]+\]\]$/gm,
+						(header) => header.replace(/document=[a-f0-9]+ /, "document=00000000deadbeef "));
+				assert.notEqual(edited, original);
+				await writeFile(path, edited, "utf8");
+				await emit(harness, "turn_end", {});
+				const persisted = harness.branch.filter((entry) => entry.customType === LIVE_CONTEXT_STATE).at(-1);
+				assert.equal(persisted.data.lastOutcome.kind, "applied", "CLM checkpoint accepts the diagnostic-only edit");
+				assert.equal(persisted.data.revision, 1);
+				assert.ok(persisted.data.checkpoint);
+
+				const next = await emit(harness, "context", { messages: raw });
+				const visible: LiveContextMessage[] = next[0].messages;
+				assert.equal(visible[0], raw[0]);
+				assert.equal(visible.length, 3);
+				if (mode === "mixed") {
+					assert.deepEqual(visible[1].content, [
+						{ type: "text", text: `Current body.\n\n${staleHeaders[2]}\nStale body.` },
+					]);
+					assert.equal(visible[1].timestamp, 2);
+				} else {
+					assert.equal(visible[1].customType, "live-context-projection");
+					assert.equal(visible[1].content,
+						`[context role=notes]\n${staleHeaders[0]}\nKeep the task.\n\n${staleHeaders[1]}\nCurrent body.\n\n${staleHeaders[2]}\nStale body.`);
+				}
+				assert.deepEqual(raw, [
+					{ role: "user", content: "Keep the task.", timestamp: 1 },
+					{ role: "assistant", content: "Current body.", timestamp: 2 },
+					{ role: "assistant", content: "Stale body.", timestamp: 3 },
+				]);
+				const notice = visible.find((message) => message.customType === "live-context-notice");
+				assert.ok(notice, "next context delivers an acceptance notice");
+				const text = String(notice.content);
+				assert.doesNotMatch(text, /not applied|earlier context revision/i,
+					"consumer notice must not claim retained content was discarded or infer an earlier revision");
+				assert.match(text, /Unrecognized stale-nonce header/,
+					"consumer notice must include stale diagnostics for both accepted paths");
+				assert.match(text, /text and following body/);
+				assert.match(text, /message body.*notes/);
+				assert.match(text, /copy.*current mirror/i);
+				if (mode === "all-stale") {
+					assert.match(text, /Accepted a headerless rewrite/);
+				}
+			} finally {
+				await emit(harness, "session_shutdown", {});
+			}
+		});
+	}
+
 	test("failed persistence leaves the previous projection active", async () => {
 		const harness = createHarness();
 		clmExtension(harness.pi);

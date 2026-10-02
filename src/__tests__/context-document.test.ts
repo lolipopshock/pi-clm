@@ -328,6 +328,107 @@ describe("nonce-bound framing", () => {
 		assert.match(JSON.stringify(result.messages.at(-2)), new RegExp(first.documentId));
 	});
 
+	void test("mixed current and stale headers retain the stale body under the preceding source with a truthful warning", () => {
+		const messages: LiveContextMessage[] = [
+			{ role: "user", content: "Keep the task.", timestamp: 1 },
+			{ role: "assistant", content: "Current body.", timestamp: 2 },
+			{ role: "assistant", content: "Stale body.", timestamp: 3 },
+			{ role: "user", content: "Continue.", timestamp: 4 },
+		];
+		const snapshot = renderContextDocument(messages);
+		const staleHeader = snapshot.blocks[2].header.replace(
+			`document=${snapshot.documentId} `,
+			"document=00000000deadbeef ",
+		);
+		const edited = snapshot.text.replace(snapshot.blocks[2].header, staleHeader);
+		assert.notEqual(edited, snapshot.text);
+		const result = applyContextDocument(edited, snapshot, { requireShrink: false });
+
+		assert.equal(result.accepted, true, "mixed current/stale edit remains accepted");
+		assert.equal(result.changed, true);
+		assert.equal(result.messages.length, 3);
+		assert.equal(result.messages[0], messages[0]);
+		assert.deepEqual(result.messages[1].content, [
+			{ type: "text", text: `Current body.\n\n${staleHeader}\nStale body.` },
+		]);
+		assert.equal(result.messages[1].role, "assistant");
+		assert.equal(result.messages[1].timestamp, 2);
+		assert.equal(result.messages[2], messages[3]);
+		assert.deepEqual(result.editTrace?.sources, [
+			{ sourceIndex: 0, outputIndex: 0, kind: "kept" },
+			{ sourceIndex: 1, outputIndex: 1, kind: "edited" },
+			{ sourceIndex: 2, kind: "removed" },
+			{ sourceIndex: 3, outputIndex: 2, kind: "kept" },
+		]);
+		const warning = result.diagnostics.join(" ");
+		assert.doesNotMatch(warning, /not applied|earlier context revision/i,
+			"mixed warning must not claim retained content was discarded or infer an earlier revision");
+		assert.match(warning, /Unrecognized stale-nonce header/);
+		assert.match(warning, new RegExp(snapshot.blocks[2].id));
+		assert.match(warning, /text and following body/);
+		assert.match(warning, /message body.*notes/);
+		assert.match(warning, /copy.*current mirror/i);
+	});
+
+	void test("all-stale CLM headers accept a notes rewrite and report stale diagnostics as well as the rewrite notice", () => {
+		const messages: LiveContextMessage[] = [
+			{ role: "user", content: "Keep the task.", timestamp: 1 },
+			{ role: "assistant", content: "Stale body.", timestamp: 2 },
+			{ role: "user", content: "Continue.", timestamp: 3 },
+		];
+		const snapshot = renderContextDocument(messages);
+		const staleHeaders = snapshot.blocks.map((block) => block.header.replace(
+			`document=${snapshot.documentId} `,
+			"document=00000000deadbeef ",
+		));
+		const edited = snapshot.text.replaceAll(
+			`[[CTX_TURN document=${snapshot.documentId} `,
+			"[[CTX_TURN document=00000000deadbeef ",
+		);
+		const result = applyContextDocument(edited, snapshot, { editingMode: "clm" });
+
+		assert.equal(result.accepted, true, "all-stale CLM rewrite remains accepted");
+		assert.equal(result.changed, true);
+		assert.equal(result.messages.length, 2);
+		assert.equal(result.messages[0], messages[0]);
+		assert.equal(result.messages[1].customType, "live-context-projection");
+		assert.equal(result.messages[1].content,
+			`[context role=notes]\n${staleHeaders[0]}\nKeep the task.\n\n${staleHeaders[1]}\nStale body.\n\n${staleHeaders[2]}\nContinue.`);
+		assert.deepEqual(result.editTrace?.sources, [
+			{ sourceIndex: 0, outputIndex: 0, kind: "kept" },
+			{ sourceIndex: 1, kind: "removed" },
+			{ sourceIndex: 2, kind: "removed" },
+		]);
+		assert.deepEqual(result.editTrace?.additions, [{ outputIndex: 1, kind: "added" }]);
+		assert.match(result.diagnostics.join(" "), /Accepted a headerless rewrite/);
+		const staleWarnings = result.diagnostics.filter((line) => line.startsWith("Unrecognized stale-nonce header"));
+		assert.equal(staleWarnings.length, 3, "all-stale accepted rewrite must report each stale header");
+		for (const warning of staleWarnings) {
+			assert.match(warning, /text and following body/);
+			assert.match(warning, /message body.*notes/);
+			assert.match(warning, /copy.*current mirror/i);
+			assert.doesNotMatch(warning, /not applied|earlier context revision/i);
+		}
+	});
+
+	void test("a genuine free-text CLM summary stays accepted without stale-header warnings", () => {
+		const messages: LiveContextMessage[] = [
+			{ role: "user", content: "Keep the task.", timestamp: 1 },
+			{ role: "assistant", content: "Detailed investigation.", timestamp: 2 },
+		];
+		const snapshot = renderContextDocument(messages);
+		const result = applyContextDocument("The parser needs an escaped-delimiter fix.", snapshot, { editingMode: "clm" });
+
+		assert.equal(result.accepted, true);
+		assert.equal(result.messages.length, 2);
+		assert.equal(result.messages[0], messages[0]);
+		assert.equal(result.messages[1].customType, "live-context-projection");
+		assert.equal(result.messages[1].content, "[context role=notes]\nThe parser needs an escaped-delimiter fix.");
+		assert.equal(result.diagnostics.length, 1);
+		assert.match(result.diagnostics[0], /Accepted a headerless rewrite/);
+		assert.doesNotMatch(result.diagnostics[0], /stale-nonce header/i);
+	});
+
 	test("a malformed header carrying the current document nonce is rejected", () => {
 		const snapshot = renderContextDocument(conversation());
 		const malformed = snapshot.text.replace(" role=assistant ", " role=assistant missing=true ");
