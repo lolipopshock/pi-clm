@@ -546,7 +546,16 @@ export function applyContextDocument(
 		return rejected(snapshot, beforeEstimate, `Mirror contains duplicate block IDs: ${parsed.duplicateIds.join(", ")}.`);
 	}
 	if (parsed.malformedCurrentHeaders.length > 0) {
-		return rejected(snapshot, beforeEstimate, "Mirror contains malformed headers for the current document.");
+		const shown = parsed.malformedCurrentHeaders
+			.slice(0, 3)
+			.map((line) => JSON.stringify(line.length > 160 ? `${line.slice(0, 157)}...` : line));
+		return rejected(
+			snapshot,
+			beforeEstimate,
+			`Mirror contains malformed headers for the current document (${parsed.malformedCurrentHeaders.length}): ${shown.join("; ")}. ` +
+				"Each header must be one standalone line [[CTX_TURN document=... index=N role=... id=... protected=true|false]] with the body starting on the next line; " +
+				"if body text is glued to the closing ]], insert a newline after it.",
+		);
 	}
 
 	const sourceById = new Map(snapshot.blocks.map((block) => [block.id, block]));

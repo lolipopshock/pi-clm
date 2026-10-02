@@ -335,6 +335,17 @@ describe("nonce-bound framing", () => {
 		assert.equal(result.accepted, false);
 		assert.match(result.reason ?? "", /malformed headers/);
 	});
+
+	void test("the malformed-header rejection names the offending line and the recovery", () => {
+		const snapshot = renderContextDocument(conversation());
+		const header = snapshot.blocks[1].header;
+		const glued = snapshot.text.replace(`${header}\n`, `${header} body text glued to the closing bracket\n`);
+		assert.notEqual(glued, snapshot.text);
+		const result = applyContextDocument(glued, snapshot, { requireShrink: false });
+		assert.equal(result.accepted, false);
+		assert.match(result.reason ?? "", new RegExp(snapshot.blocks[1].id));
+		assert.match(result.reason ?? "", /insert a newline after/);
+	});
 });
 
 describe("opaque content preservation", () => {
