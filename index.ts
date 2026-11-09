@@ -54,5 +54,6 @@ export default function clmExtension(pi: ExtensionAPI): void {
 		oneToolPerTurn: flagFromEnv("PI_CLM_ONE_TOOL_PER_TURN"),
 		sizeTrailer: flagFromEnv("PI_CLM_SIZE_TRAILER"),
 		compactPromptPath: compactPromptFromEnv(),
+		banner: { enabled: true },
 	});
 }

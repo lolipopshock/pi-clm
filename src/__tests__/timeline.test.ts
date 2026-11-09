@@ -53,9 +53,11 @@ describe("context timeline", () => {
 			["reset", 3, 3, undefined, undefined],
 		]);
 	});
-	test("falls back to summed usage and tolerates empty branches", () => {
+	test("counts prompt usage separately from output and tolerates empty branches", () => {
 		const summed = buildContextTimeline([{ type: "message", message: { role: "assistant", usage: { input: 10, output: 5, cacheRead: 100, cacheWrite: 0 } } } as SessionEntryLike]);
-		assert.equal(summed.points[0]?.tokens, 115);
+		assert.equal(summed.points[0]?.tokens, 110);
+		assert.equal(summed.points[0]?.outputTokens, 5);
+		assert.match(describeTimelineBucket(summed, layoutTimeline(summed, { width: 40 }).buckets[0]!), /110 tok · 5 generated tok/);
 		assert.deepEqual(buildContextTimeline([]), { points: [], markers: [], peakTokens: 0, turnStarts: [] });
 		assert.deepEqual(renderTimelineChart(buildContextTimeline([]), { width: 40, height: 5 }), ["No completed requests on this branch yet."]);
 	});

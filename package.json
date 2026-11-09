@@ -1,6 +1,6 @@
 {
   "name": "@lolipopshock/pi-clm",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Pi extension that lets the model manage its own context: the next request's context is mirrored to a file the model edits with ordinary tools",
   "type": "module",
   "license": "MIT",

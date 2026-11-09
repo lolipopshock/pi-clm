@@ -6,7 +6,7 @@
  * extra persistence:
  *
  * - one point per completed assistant message with provider usage — the provider-reported
- *   size of that request (`totalTokens`, or input+output+cache when absent);
+ *   prompt size of that request (input + cache, excluding generated output);
  * - one marker per `live-context-state` entry whose outcome was `applied` (an accepted
  *   context edit, with its recorded before/after estimate), `reset`, or a rejection.
  *
@@ -15,13 +15,16 @@
 
 import type { LiveContextState, SessionEntryLike } from "./state.ts";
 import { isLiveContextState } from "./state.ts";
+import { promptTokens } from "./usage.ts";
 
 export interface TimelinePoint {
 	/** 1-based request number on this branch. */
 	request: number;
 	at?: string;
-	/** Provider-reported context size of this request. */
+	/** Provider-reported prompt size of this request, excluding output. */
 	tokens: number;
+	/** Generated tokens, shown separately when reported. */
+	outputTokens?: number;
 	/** Live-context revision active when the request was answered. */
 	revision: number;
 }
@@ -60,12 +63,6 @@ interface MessageEntryLike extends SessionEntryLike {
 	};
 }
 
-function usageTokens(usage: NonNullable<MessageEntryLike["message"]>["usage"]): number {
-	if (!usage) return 0;
-	if (typeof usage.totalTokens === "number" && usage.totalTokens > 0) return usage.totalTokens;
-	return (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-}
-
 function isoTime(value: number | string | undefined): string | undefined {
 	if (value === undefined) return undefined;
 	const date = new Date(value);
@@ -85,9 +82,12 @@ export function buildContextTimeline(entries: readonly SessionEntryLike[]): Cont
 			if (message?.role === "user") pendingTurn = true;
 			if (!message || message.role !== "assistant") continue;
 			if (message.stopReason === "aborted" || message.stopReason === "error") continue;
-			const tokens = usageTokens(message.usage);
+			const tokens = promptTokens(message.usage);
 			if (tokens <= 0) continue;
-			points.push({ request: points.length + 1, at: isoTime(message.timestamp), tokens, revision });
+			points.push({
+				request: points.length + 1, at: isoTime(message.timestamp), tokens, revision,
+				...(message.usage?.output !== undefined ? { outputTokens: message.usage.output } : {}),
+			});
 			if (pendingTurn) turnStarts.push(points.length - 1);
 			pendingTurn = false;
 			continue;
@@ -341,6 +341,9 @@ export function describeTimelineBucket(timeline: ContextTimeline, bucket: Timeli
 		];
 	const span = timeSpan(timeline, bucket.first, bucket.last);
 	if (span) parts.splice(1, 0, span);
+	const outputTokens = timeline.points.slice(bucket.first, bucket.last + 1)
+		.reduce((total, point) => total + (point.outputTokens ?? 0), 0);
+	if (outputTokens > 0) parts.push(`${formatTokenCount(outputTokens)} generated tok`);
 	if (bucket.turns > 0) parts.push(`${bucket.turns} user turn${bucket.turns === 1 ? "" : "s"}`);
 	if (bucket.edits.length > 0) parts.push(`${bucket.edits.length} accepted edit${bucket.edits.length === 1 ? "" : "s"}`);
 	return parts.join(" · ");

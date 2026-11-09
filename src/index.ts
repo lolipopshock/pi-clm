@@ -5,7 +5,6 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	buildSessionContext,
-	calculateContextTokens,
 	estimateTokens,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
@@ -38,6 +37,7 @@ import {
 	type LiveContextRetention,
 } from "./continuity.ts";
 import { MirrorStore } from "./mirror-store.ts";
+import { promptTokens } from "./usage.ts";
 import {
 	BudgetTracker,
 	EstimateCalibrator,
@@ -72,6 +72,8 @@ import {
 	applyProjection,
 	createProjectionCheckpoint,
 	PROJECTION_PREFIX_MISMATCH_REASON,
+	PROJECTION_SHORTER_REASON,
+	recoverProjectionAtEditBoundary,
 	recoverProjectionFromRetryErrors,
 	type ProjectionCheckpoint,
 	type ProjectionRecovery,
@@ -84,6 +86,8 @@ import {
 	resetProjectionState,
 	toOutcomeEntry,
 } from "./state.ts";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { bannerHeader, bannerLines, bannerMarkerPath, claimFirstRun } from "./banner.ts";
 import { buildCompactPrompt, loadCompactPrompt } from "./compact.ts";
 import {
 	applyOverrides,
@@ -132,10 +136,12 @@ const RecallParameters = Type.Object({
 });
 
 function asLiveMessages(messages: AgentMessage[]): LiveContextMessage[] {
+	// SAFETY: LiveContextMessage is a permissive structural view; original Pi objects are retained.
 	return messages as unknown as LiveContextMessage[];
 }
 
 function asAgentMessages(messages: LiveContextMessage[]): AgentMessage[] {
+	// SAFETY: callers reuse Pi messages or validated CLM-lowered messages, never authored wire roles.
 	return messages as unknown as AgentMessage[];
 }
 
@@ -145,6 +151,7 @@ function estimateLiveContextTokens(messages: LiveContextMessage[]): number {
 	return messages.reduce((total, message) => {
 		let tokens = tokenEstimateCache.get(message);
 		if (tokens === undefined) {
+			// SAFETY: estimates use the same Pi-compatible message objects as the outgoing context.
 			tokens = estimateTokens(message as unknown as AgentMessage);
 			tokenEstimateCache.set(message, tokens);
 		}
@@ -163,12 +170,13 @@ function estimateTextTokens(text: string): number {
  */
 function lastProviderReportedTokens(rawMessages: LiveContextMessage[]): { tokens: number; index: number } | undefined {
 	for (let index = rawMessages.length - 1; index >= 0; index--) {
+		// SAFETY: rawMessages reuses Pi-sourced messages; restore their union before narrowing the role.
 		const message = rawMessages[index] as unknown as AgentMessage;
 		if (message.role !== "assistant") continue;
 		if (message.stopReason === "aborted" || message.stopReason === "error") continue;
 		const usage = message.usage;
 		if (!usage) continue;
-		const tokens = calculateContextTokens(usage);
+		const tokens = promptTokens(usage);
 		if (tokens > 0) return { tokens, index };
 	}
 	return undefined;
@@ -222,6 +230,12 @@ export interface LiveContextExtensionOptions {
 	sizeTrailer?: boolean;
 	/** `/clm-compact` prompt template (markdown with {{placeholders}}); default is the built-in prompt. */
 	compactPromptPath?: string;
+	/**
+	 * CLM-mode banner: on the first session after install, replace Pi's startup header with a
+	 * short introduction; `/clm about` shows it again. Off unless enabled, so hosts and tests
+	 * never write the marker file (`<agent dir>/pi-clm/welcomed` unless `markerPath` is given).
+	 */
+	banner?: { enabled?: boolean; markerPath?: string };
 }
 
 export default function liveContextExtension(pi: ExtensionAPI, options: LiveContextExtensionOptions = {}): void {
@@ -242,6 +256,8 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 	let currentContextView: CurrentContextView | undefined;
 	let annotations: LiveContextAnnotation[] = [];
 	let checkpointHistory: ProjectionCheckpoint[] = [];
+	/** The reset revision whose revival already failed; the checked prefix cannot change until the state does. */
+	let revivalFailedAt: number | undefined;
 	const pressure = new PressureTracker();
 	const continuitySize = new ContinuitySizeTracker();
 	let budgetPolicy = resolveBudgetPolicy(options.budget);
@@ -665,6 +681,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		awaitObservationForRevision = undefined;
 		invalidationStreak = 0;
 		compositionWarned = false;
+		revivalFailedAt = undefined;
 		continuitySize.reset();
 		budgetTracker.reset();
 		lastBudgetReading = undefined;
@@ -677,20 +694,39 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		pendingNotice = `[LIVE CONTEXT] ${message}`;
 	}
 
-	function findHistoricalRecovery(rawMessages: LiveContextMessage[]): {
+	/**
+	 * The branch begins at an entry whose parent never reached the session file: Pi keeps an
+	 * entry it failed to write (e.g. on a full disk), and later entries name it as their parent,
+	 * so on resume the rebuilt history stops there and everything before it is missing.
+	 */
+	function branchLostEntries(ctx: ExtensionContext): boolean {
+		const parentId = ctx.sessionManager.getBranch()[0]?.parentId;
+		return typeof parentId === "string" &&
+			typeof ctx.sessionManager.getEntry === "function" &&
+			ctx.sessionManager.getEntry(parentId) === undefined;
+	}
+
+	function findHistoricalRecovery(ctx: ExtensionContext, rawMessages: LiveContextMessage[]): {
 		target: ProjectionCheckpoint;
 		recovery: Extract<ProjectionRecovery, { valid: true }>;
 	} | undefined {
-		if (
-			state.checkpoint ||
-			state.lastOutcome?.kind !== "reset" ||
-			state.lastOutcome.message !== PROJECTION_PREFIX_MISMATCH_REASON
-		) return undefined;
+		if (state.checkpoint || state.lastOutcome?.kind !== "reset" || revivalFailedAt === state.revision) return undefined;
+		// Resets may carry a description after the reason. A shorter history is revived only
+		// when the session file lost entries; otherwise it was shortened on purpose.
+		const mismatch = state.lastOutcome.message.startsWith(PROJECTION_PREFIX_MISMATCH_REASON);
+		const lostHistory = branchLostEntries(ctx);
+		if (!mismatch && !(lostHistory && state.lastOutcome.message.startsWith(PROJECTION_SHORTER_REASON))) return undefined;
 
-		for (const target of [...checkpointHistory].sort((left, right) => right.revision - left.revision)) {
+		const newestFirst = [...checkpointHistory].sort((left, right) => right.revision - left.revision);
+		for (const target of newestFirst) {
 			const recovery = recoverProjectionFromRetryErrors(rawMessages, target, checkpointHistory);
 			if (recovery.valid && recovery.removedErrorCount > 0) return { target, recovery };
 		}
+		// Only the checkpoint the reset replaced is revived by its edit boundary.
+		const newest = newestFirst[0];
+		const recovery = newest ? recoverProjectionAtEditBoundary(rawMessages, newest, { lostHistory }) : undefined;
+		if (newest && recovery?.valid) return { target: newest, recovery };
+		revivalFailedAt = state.revision;
 		return undefined;
 	}
 
@@ -706,10 +742,23 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		const anchor = recovery.anchorRevision === undefined
 			? "the session start"
 			: `revision ${recovery.anchorRevision}`;
-		const message =
-			`Recovered projection revision ${target.revision} after resume by reconciling` +
-			` ${recovery.removedErrorCount} persisted retry error response(s) after ${anchor};` +
-			` rebased as revision ${revision}.`;
+		const message = recovery.unverified === "lost-history"
+			? `Recovered projection revision ${target.revision} after resume, unverified: the session file lost entries` +
+				` before this branch (a write failed, e.g. on a full disk), so the rebuilt history lacks part of its source;` +
+				` its edit's reply is message ${recovery.boundary} of the rebuilt history; rebased as revision ${revision}.`
+			: recovery.boundary !== undefined
+			? `Recovered projection revision ${target.revision} after resume${recovery.unverified ? ", unverified" : ""}:` +
+				` its source ends at message ${recovery.boundary} of the rebuilt history` +
+				(recovery.removedErrorCount > 0
+					? `, which keeps ${recovery.removedErrorCount} failed response(s) the live conversation had dropped`
+					: "") +
+				(recovery.unverified === "extension-messages"
+					? " (the prefix holds extension messages, which Pi timestamps differently live and in the session file)"
+					: "") +
+				`; rebased as revision ${revision}.`
+			: `Recovered projection revision ${target.revision} after resume by reconciling` +
+				` ${recovery.removedErrorCount} persisted retry error response(s) after ${anchor};` +
+				` rebased as revision ${revision}.`;
 		const checkpoint = createProjectionCheckpoint({
 			revision,
 			sourceMessages: rawMessages,
@@ -815,6 +864,18 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 			display: false,
 			timestamp: Date.now(),
 		};
+	}
+
+	function withManagedContinuity(
+		effectiveMessages: LiveContextMessage[],
+		managedContinuity: LiveContextMessage | undefined,
+	): LiveContextMessage[] {
+		if (!managedContinuity) return effectiveMessages;
+		// Leading continuity preserves the serialized request prefix as conversation
+		// turns are appended, provided the annotation snapshot remains unchanged.
+		return editingMode === "clm"
+			? [managedContinuity, ...effectiveMessages]
+			: [...effectiveMessages, managedContinuity];
 	}
 
 	pi.on("resources_discover", () => ({
@@ -956,13 +1017,14 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 	pi.registerCommand(commandName, {
 		description:
 			editingMode === "clm"
-				? "Open the CLM panel (overview · input · edits · settings); or status, config [<setting> <value> | reset], on, off, reset, path"
+				? "Open the CLM panel (overview · input · edits · settings); or status, about, config [<setting> <value> | reset], on, off, reset, path"
 				: "Inspect or control live context: status, on, off, reset, path",
 		getArgumentCompletions(prefix: string) {
 			const words = editingMode === "clm"
 				? [
 					...CLM_VIEW_TABS,
 					"status",
+					"about",
 					"config",
 					...CLM_SETTING_COMMAND_KEYS.map((key) => `config ${key}`),
 					"config reset",
@@ -1050,14 +1112,15 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 	/**
 	 * The exact context-hook snapshot when there is one: checkpoints anchor to that message
 	 * space, which may differ from the raw session after earlier context handlers. Before
-	 * the hook has run (e.g. just after resume), reconstruct it from the session.
+	 * the hook has run (e.g. just after resume), reconstruct its conversation-only message
+	 * space from the session: newer Pi stores prompt/tool system messages outside this hook.
 	 */
 	function contextSnapshot(ctx: ExtensionContext): CurrentContextView & { rawMessages: LiveContextMessage[] } {
 		const captured = currentContextView;
 		if (captured?.rawMessages) return { ...captured, rawMessages: captured.rawMessages };
 		const sessionRawMessages = asLiveMessages(
 			buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages,
-		);
+		).filter((message) => message.role !== "system");
 		const sessionProjection = state.enabled ? applyProjection(sessionRawMessages, state.checkpoint) : undefined;
 		const visibleRaw = selectContextVisibleMessages(sessionRawMessages);
 		const effective = selectContextVisibleMessages(
@@ -1068,7 +1131,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 			: [];
 		const rawTokens = estimateLiveContextTokens(visibleRaw);
 		const managedContinuity = continuityMessage(ctx, effective);
-		const modelEffective = managedContinuity ? [...effective, managedContinuity] : effective;
+		const modelEffective = withManagedContinuity(effective, managedContinuity);
 		return {
 			rawMessageCount: sessionRawMessages.length,
 			rawMessages: [...sessionRawMessages],
@@ -1184,6 +1247,10 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 				ctx.ui.notify(shortStatus(ctx), "info");
 				return;
 			}
+			if (verb === "about") {
+				showBanner(ctx, "about");
+				return;
+			}
 			if (verb === "config") {
 				await configCommand(rest, ctx);
 				return;
@@ -1193,7 +1260,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 				return;
 			}
 		}
-		const [actionWord = "status", ...rest] = words.map((word) => word.toLowerCase());
+		const [actionWord = "status"] = words.map((word) => word.toLowerCase());
 		const action = actionWord;
 		switch (action) {
 			case "status": {
@@ -1245,6 +1312,27 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		);
 	}
 
+	const bannerEnabled = editingMode === "clm" && options.banner?.enabled === true;
+
+	/** A host that can show a header: the TUI (print/RPC hosts, and older Pi, cannot). */
+	function canShowHeader(ctx: ExtensionContext): boolean {
+		return contextMode(ctx) === "tui" && ctx.hasUI && typeof ctx.ui.setHeader === "function";
+	}
+
+	/** Put the banner in Pi's header for this session; where that is impossible, `about` prints it. */
+	function showBanner(ctx: ExtensionContext, reason: "first-run" | "about"): void {
+		if (!canShowHeader(ctx)) {
+			if (reason === "about") ctx.ui.notify(bannerLines().join("\n"), "info");
+			return;
+		}
+		ctx.ui.setHeader((_tui, theme) => bannerHeader(theme));
+	}
+
+	function showBannerIfFirstRun(ctx: ExtensionContext): void {
+		if (!bannerEnabled || !canShowHeader(ctx)) return;
+		if (claimFirstRun(options.banner?.markerPath ?? bannerMarkerPath(getAgentDir()))) showBanner(ctx, "first-run");
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		pressure.reset();
 		budgetTracker.reset();
@@ -1254,13 +1342,24 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		if (steeringError) ctx.ui.notify(`pi-clm: steering document not loaded: ${steeringError}`, "warning");
 		await replaceStore(ctx);
 		updateStatus(ctx);
+		showBannerIfFirstRun(ctx);
 	});
 
 	pi.on("before_agent_start", async (event) => {
 		if (!state.enabled || !store) return;
-		const sections = [event.systemPrompt, systemGuidance(store.filePath, editingMode)];
+		const sections = [systemGuidance(store.filePath, editingMode)];
 		if (steering) sections.push(steeringPromptSection(steering));
-		return { systemPrompt: sections.join("\n\n") };
+		const guidance = sections.join("\n\n");
+		const options = event.systemPromptOptions as typeof event.systemPromptOptions & {
+			sections?: Record<string, string>;
+		};
+		// A whole-prompt return freezes a forced snapshot on newer Pi, hiding later additions.
+		if (options?.sections) {
+			options.sections.live_context_management = guidance;
+			return;
+		}
+		// Older Pi exposes read-only options and composes string returns instead.
+		return { systemPrompt: [event.systemPrompt, guidance].join("\n\n") };
 	});
 
 	pi.on("context", async (event, ctx) => {
@@ -1273,7 +1372,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		if (!store) {
 			turnBaseline = undefined;
 			const managedContinuity = continuityMessage(ctx, rawMessages);
-			const output = managedContinuity ? [...rawMessages, managedContinuity] : [...rawMessages];
+			const output = [...withManagedContinuity(rawMessages, managedContinuity)];
 			const sizeNotice = continuitySizeNotice(managedContinuity);
 			if (sizeNotice) {
 				output.push({
@@ -1294,14 +1393,18 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 
 		if (!projection.valid && state.checkpoint) {
 			const target = state.checkpoint;
-			const recovery = recoverProjectionFromRetryErrors(rawMessages, target, checkpointHistory);
+			const retry = recoverProjectionFromRetryErrors(rawMessages, target, checkpointHistory);
+			const recovery = retry.valid ? retry : recoverProjectionAtEditBoundary(rawMessages, target, { lostHistory: branchLostEntries(ctx) });
 			if (recovery.valid) {
 				rebaseRecoveredProjection(rawMessages, target, recovery);
 				projection = recovery;
 				recovered = true;
+			} else {
+				// Say what differs, so a reset can be diagnosed from the session alone.
+				projection = { ...projection, reason: `${projection.reason} ${recovery.reason}` };
 			}
 		} else if (!state.checkpoint) {
-			const historical = findHistoricalRecovery(rawMessages);
+			const historical = findHistoricalRecovery(ctx, rawMessages);
 			if (historical) {
 				rebaseRecoveredProjection(rawMessages, historical.target, historical.recovery);
 				projection = historical.recovery;
@@ -1367,9 +1470,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 			? rawTokens
 			: estimateLiveContextTokens(effectiveMessages);
 		const managedContinuity = continuityMessage(ctx, effectiveMessages);
-		const modelEffectiveMessages = managedContinuity
-			? [...effectiveMessages, managedContinuity]
-			: effectiveMessages;
+		const modelEffectiveMessages = withManagedContinuity(effectiveMessages, managedContinuity);
 		currentContextView = {
 			rawMessageCount: rawMessages.length,
 			rawMessages: [...rawMessages],
@@ -1383,7 +1484,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		};
 		updateStatus(ctx);
 
-		// Extension-managed continuity is appended after the editable projection so
+		// Extension-managed continuity stays outside the editable projection so
 		// mirror compression cannot silently remove an active obligation or exact pin.
 		const snapshot = renderContextDocument(effectiveMessages, {
 			revision: state.revision,
@@ -1656,9 +1757,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 			return;
 		}
 		const managedContinuity = continuityMessage(ctx, result.messages);
-		const modelEffectiveMessages = managedContinuity
-			? [...result.messages, managedContinuity]
-			: result.messages;
+		const modelEffectiveMessages = withManagedContinuity(result.messages, managedContinuity);
 		currentContextView = {
 			rawMessageCount: baseline.rawMessages.length,
 			rawMessages: [...baseline.rawMessages],

@@ -34,6 +34,7 @@ interface ParsedDocument {
 	preamble: string;
 	duplicateIds: string[];
 	malformedCurrentHeaders: string[];
+	staleNonceHeaders: string[];
 }
 
 function normalizeJson(value: unknown): unknown {
@@ -219,6 +220,10 @@ export function renderContextDocument(
 	};
 }
 
+function truncateDiagnosticLine(line: string): string {
+	return line.length > 160 ? `${line.slice(0, 157)}...` : line;
+}
+
 function parseDocument(text: string, snapshot: ContextDocumentSnapshot): ParsedDocument {
 	const metadata = META_RE.exec(text);
 	const blockRe = new RegExp(
@@ -253,6 +258,16 @@ function parseDocument(text: string, snapshot: ContextDocumentSnapshot): ParsedD
 		.map((line) => line.trim())
 		.filter((line) => line.startsWith(currentPrefix) && !validHeaderLines.has(line));
 
+	const staleNonceHeaderRe =
+		/^\[\[CTX_TURN document=([a-zA-Z0-9-]+) index=\d+ role=[A-Za-z][A-Za-z0-9_-]* id=[a-zA-Z0-9-]+ protected=(?:true|false)\]\]$/;
+	const staleNonceHeaders = text
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter((line) => {
+			const match = staleNonceHeaderRe.exec(line);
+			return match !== null && match[1] !== snapshot.documentId;
+		});
+
 	const metadataEnd = metadata ? metadata[0].length : 0;
 	const firstBlockStart = matches[0]?.index ?? text.length;
 	const preamble = text
@@ -271,6 +286,7 @@ function parseDocument(text: string, snapshot: ContextDocumentSnapshot): ParsedD
 		preamble,
 		duplicateIds,
 		malformedCurrentHeaders,
+		staleNonceHeaders,
 	};
 }
 
@@ -493,6 +509,12 @@ export function applyContextDocument(
 	};
 
 	const parsed = parseDocument(editedText, snapshot);
+	const diagnostics: string[] = [];
+	for (const line of parsed.staleNonceHeaders.slice(0, 3)) {
+		diagnostics.push(
+			`Unrecognized stale-nonce header: ${JSON.stringify(truncateDiagnosticLine(line))}. It is not a recognized block boundary. Its text and following body may be incorporated into another message body or notes. Copy the header from the current mirror if you meant to edit that block.`,
+		);
+	}
 	const metadataLine = snapshot.text.split("\n")[0] ?? "";
 	// CLM: a file with no current block headers at all is the model replacing its whole
 	// context with free text (the paper's "collapse to a summary" move). Accept it as one
@@ -520,11 +542,12 @@ export function applyContextDocument(
 		}
 		candidate.push(contextNote(body, undefined, "notes"));
 		candidateOrigins.push({ kind: "added" });
-		return finalize(candidate, candidateOrigins, removedSourceIndexes, [
+		diagnostics.push(
 			"Accepted a headerless rewrite: every block was replaced by one notes block" +
 				(firstUserIndex >= 0 ? " after the first user turn" : "") +
 				". To edit blocks individually, keep the [[CTX_TURN ...]] headers.",
-		]);
+		);
+		return finalize(candidate, candidateOrigins, removedSourceIndexes, diagnostics);
 	}
 	// With a stable document the baseline digest still changes every render (new raw
 	// messages), so only the revision and nonce identify the document the model edited.
@@ -546,7 +569,16 @@ export function applyContextDocument(
 		return rejected(snapshot, beforeEstimate, `Mirror contains duplicate block IDs: ${parsed.duplicateIds.join(", ")}.`);
 	}
 	if (parsed.malformedCurrentHeaders.length > 0) {
-		return rejected(snapshot, beforeEstimate, "Mirror contains malformed headers for the current document.");
+		const shown = parsed.malformedCurrentHeaders
+			.slice(0, 3)
+			.map((line) => JSON.stringify(line.length > 160 ? `${line.slice(0, 157)}...` : line));
+		return rejected(
+			snapshot,
+			beforeEstimate,
+			`Mirror contains malformed headers for the current document (${parsed.malformedCurrentHeaders.length}): ${shown.join("; ")}. ` +
+				"Each header must be one standalone line [[CTX_TURN document=... index=N role=... id=... protected=true|false]] with the body starting on the next line; " +
+				"if body text is glued to the closing ]], insert a newline after it.",
+		);
 	}
 
 	const sourceById = new Map(snapshot.blocks.map((block) => [block.id, block]));
@@ -567,7 +599,6 @@ export function applyContextDocument(
 		);
 	}
 
-	const diagnostics: string[] = [];
 	const candidate: LiveContextMessage[] = [];
 	const candidateOrigins: Array<{ sourceIndex?: number; kind: ContextEditSourceKind | "added" }> = [];
 	const removedSourceIndexes = new Set<number>();

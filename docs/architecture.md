@@ -14,7 +14,7 @@ limitations.
 Pi session JSONL (raw, append-only, branch-aware)
              │  context hook
              ▼
-Effective context — the AgentMessage[] actually sent to the provider
+Effective conversation — CLM's projection + source suffix
              │  rendered before every request
              ▼
 Mirror file  — LIVE_CONTEXT.md, model-editable
@@ -24,8 +24,12 @@ Revision checkpoint — persisted as a Pi custom entry on the active branch
 ```
 
 - **Raw transcript** is the source of truth and audit log. Nothing here is ever deleted.
-- **Effective context** is what the model sees. It equals the latest accepted revision plus
-  every raw message appended since that revision was anchored.
+  Pi's canonical session projection applies compaction and native context edits before
+  request hooks; a flat list of JSONL messages is not the native request context.
+- **Effective conversation** is CLM's contribution to the next request. It equals the
+  latest accepted revision plus every source message appended since that revision was
+  anchored. Later extension hooks and provider conversion can still transform it; it is
+  not a final-wire snapshot.
 - **Mirror** is a text rendering of the effective context. Editing it is the only way the
   model changes its context. It is not byte-for-byte the provider input: the system prompt,
   extension-managed annotation notes and the one-call notices are added outside it.
@@ -36,7 +40,8 @@ Revision checkpoint — persisted as a Pi custom entry on the active branch
 ## 2. Request lifecycle
 
 ```text
-before_agent_start   append the editing protocol + mirror path to the system prompt
+before_agent_start   contribute the editing protocol + mirror path as a prompt section
+                    (legacy Pi: append to the returned system prompt)
 context(raw)         1. validate the active checkpoint against the raw prefix
                      2. effective = checkpoint.messages ++ raw suffix
                      3. drop messages Pi excludes from the request
@@ -54,6 +59,13 @@ turn_end             1. read the mirror; unchanged → nothing to do
 
 Rendering happens in the `context` hook rather than on demand so the mirror is available
 to every file tool and the extension never wraps Pi's built-in tools.
+
+On Pi versions with mutable prompt sections, `before_agent_start` contributes the protocol
+and optional steering to `systemPromptOptions.sections.live_context_management`. It does
+not return a whole `systemPrompt`: on Pi 1.0.3 that creates a forced snapshot which can hide
+later extensions' section or append mutations. Pi 0.85.0 has no mutable sections API, so
+pi-clm keeps its legacy string-return path there. Another extension's deliberate forced
+prompt is never cleared or overwritten by the native-section path.
 
 ## 3. Mirror format
 
@@ -145,7 +157,49 @@ annotations are `live-context-annotation` entries.
 
 A checkpoint anchors to the digest of the messages this extension receives, so a context
 extension loaded *before* pi-clm whose transform varies between calls invalidates it.
-Load pi-clm first. Two consecutive invalidations raise a user-facing warning.
+Load pi-clm before such varying `context` transforms. Even a changing injected timestamp
+can invalidate the prefix; strict digest validation is deliberately retained. Two
+consecutive invalidations raise a user-facing warning. Native prompt sections avoid
+pi-clm's whole-prompt override, but do not make arbitrary conversation transforms
+order-independent.
+
+Before the first context-hook snapshot after resume, panels and compaction estimates use
+Pi's canonical `buildSessionContext` projection, not a flat list of JSONL messages. Pi-owned
+`system` messages are excluded from that fallback to match the context-hook message space;
+otherwise an unchanged conversation checkpoint would appear invalid in the panel. Viewing
+a fallback snapshot does not persist a checkpoint reset.
+
+Other extensions that return a complete prompt for an additive contribution can still
+freeze out later guidance, even with pi-clm disabled. This was reproduced with pi-add-dir
+1.3.1 and open-codebase-index 0.35.2 on Pi 1.0.3. Their own guidance and tools survived;
+later structured/append contributions did not. Those extensions need their own additive
+prompt-section changes; moving only pi-clm cannot repair an earlier forced snapshot.
+
+Continuity-prefix stability (#1) is separate from both prompt composition and checkpoint
+invalidation. In CLM mode the managed continuity message leads the conversation, so an
+unchanged annotation keeps the start of the request stable as turns arrive; a changed
+annotation still changes it. Native-section support does not change that ordering.
+
+Pi's live conversation and the history it rebuilds on resume differ in known ways. Pi drops
+a failed response from the live conversation when it retries it, also when a new prompt
+cancels the retry, but the session file keeps it; the final failure after the last retry
+stays in both, and so does every failure from before an earlier resume, since a resume
+rebuilds the live conversation from the file. An extension's custom message is stamped
+`Date.now()` live but gets its session entry's own, sometimes later, time in the file. And
+when a write fails (seen with a full disk), Pi keeps the entry in memory while later
+entries name it as their parent, so on resume the branch starts after it and the history
+before it is gone. A checkpoint written across any of these no longer hashes on resume, so
+recoveries run before a reset (`src/projection.ts`): removing failed responses after an
+older matching checkpoint; and locating where the edit's source prefix ends — the reply to
+the edited request, found by the checkpoint's time — accepted when removing some of the
+failed responses before it reproduces the checkpoint's digest. Where the digest cannot be
+checked the boundary is accepted unverified, and the rebase message says so: when the
+prefix holds extension messages and its extra messages could all be failed responses, or
+when the branch starts at an entry whose parent was never written (the projection, the
+model's own view of the lost history, replaces it). A recovered projection is rebased onto
+the rebuilt history at once, and a projection that such a mismatch had already reset is
+revived the same way on the next resume. When no recovery applies, the reset reason says
+what differs.
 
 ## 7. Budget and reminders
 
@@ -159,10 +213,12 @@ Two numbers are measured and always labelled separately:
 
 - **estimated next request** — system prompt + effective messages, using Pi's
   provider-independent estimator;
-- **observed previous request** — `totalTokens` of the newest successful assistant message
-  (the provider's own count). It is one call late and is marked stale after an accepted
-  edit, when it no longer describes the current context. After `/clm reset` or a native
-  compaction, status shows an estimate of the rebuilt context until the next request.
+- **observed previous request** — `input + cacheRead + cacheWrite` of the newest
+  successful assistant message, excluding generated output. Records with only
+  `totalTokens` fall back to that total minus reported output. It is one call late and
+  is marked stale after an accepted edit, when it no longer describes the current
+  context. After `/clm reset` or a native compaction, status shows an estimate of the
+  rebuilt context until the next request.
 
 A reminder is judged on the larger fresh number. In practice the estimator undercounts
 by tens of percent relative to providers, which is why the observed count may govern.
@@ -278,10 +334,11 @@ context. `/clm <page>` opens a page directly, and outside the TUI the command pr
 page as text. `/clm status` prints three lines (next request against the budget, edits,
 changed settings). Four pages:
 
-- **overview** — a bar chart of the provider-reported size of every request on the
-  branch (one column per request), the budget as a dashed line, requests followed by an
-  accepted edit marked, and the list of compaction points with per-message counts. It
-  opens on **now** (the latest request, pinned to the right edge); `← →` step through
+- **overview** — a bar chart of the provider-reported prompt size (excluding output)
+  of every request on the branch (one column per request), the budget as a dashed
+  line, requests followed by an accepted edit marked, and the list of compaction
+  points with per-message counts. It opens on **now** (the latest request, pinned to
+  the right edge); `← →` step through
   compaction points and back to now. When the branch is wider than the terminal the
   window pans to keep the selected point centred, clamped so it never shows empty columns.
   `z` cycles the x axis (`TimelineZoom` in `src/timeline.ts`; shown to users as all /
@@ -322,7 +379,14 @@ changed settings). Four pages:
   prompt, stays on screen.
 
 The timeline is built from session entries alone (assistant usage and state entries), so it
-is available on resume without extra persistence.
+is available on resume without extra persistence. Selected column descriptions show
+reported generated tokens separately from the prompt size.
+
+**First run.** On the first session after install (TUI only), pi-clm replaces Pi's startup
+header with a banner (`src/banner.ts`): the name and version, and the three commands a new
+user needs. A marker file, `<agent dir>/pi-clm/welcomed`, records that it was shown, so it
+appears once per machine; `/clm about` puts it back in the header for the current session
+(outside the TUI it prints the banner).
 
 ## 9. Storage and safety
 
@@ -342,13 +406,14 @@ is available on resume without extra persistence.
 index.ts                     entry: CLM mode + env budget policy
 src/index.ts                 Pi lifecycle: hooks, commands, tools, notices
 src/context-document.ts      render / parse / apply, role lowering, tool-group repair
-src/projection.ts            digests, prefix validation, suffix rebasing, retry recovery
+src/projection.ts            digests, prefix validation, suffix rebasing, resume recovery
 src/state.ts                 revision schema, slim entries, branch reconstruction
 src/continuity.ts            pin / continuity / archive annotations and recall
 src/mirror-store.ts          private atomic mirror file lifecycle
 src/mirror-guard.ts          classify tool calls that read or write the mirror
 src/policy.ts                conservative-mode protection and pressure tiers
 src/budget.ts                CLM budget, tiers, notice text
+src/usage.ts                 prompt-only provider usage shared by calibration and timeline
 src/observation.ts           per-tool-result cap in the effective context
 src/overflow.ts              overflow guard: withhold the oldest tool results above the limit
 src/steering.ts              steering document loading and prompt section
