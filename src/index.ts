@@ -230,6 +230,8 @@ export interface LiveContextExtensionOptions {
 	sizeTrailer?: boolean;
 	/** `/clm-compact` prompt template (markdown with {{placeholders}}); default is the built-in prompt. */
 	compactPromptPath?: string;
+	/** What the settings file held that could not be used; shown at session start and in the status until the file is fixed. */
+	settingsFileWarning?: string;
 	/**
 	 * CLM-mode banner: on the first session after install, replace Pi's startup header with a
 	 * short introduction; `/clm about` shows it again. Off unless enabled, so hosts and tests
@@ -272,7 +274,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 	let nativeCompaction = options.nativeCompaction ?? "auto";
 	let steering: SteeringDocument | undefined;
 	let steeringError: string | undefined;
-	// CLM settings: defaults come from the options (environment at load); the panel and
+	// CLM settings: defaults come from the options (settings file and environment at load); the panel and
 	// `/clm config` store per-session overrides as a branch-local session entry.
 	const baseSettings = defaultClmSettings(options);
 	let settingsOverrides: ClmSettingsOverrides = {};
@@ -486,6 +488,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 
 	function warnings(): string[] {
 		const lines: string[] = [];
+		if (options.settingsFileWarning) lines.push(`⚠ ${options.settingsFileWarning}`);
 		if (settingsWarning) lines.push(`⚠ ${settingsWarning}`);
 		if (steeringError) lines.push(`⚠ steering document not loaded: ${steeringError}`);
 		if (state.lastOutcome?.kind === "rejected") lines.push(`⚠ last edit rejected: ${state.lastOutcome.message}`);
@@ -575,7 +578,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 					label: "Reset to defaults",
 					value: Object.keys(settingsOverrides).length === 0 ? "nothing changed" : `${Object.keys(settingsOverrides).length} changed`,
 					choices: Object.keys(settingsOverrides).length === 0 ? undefined : [`${Object.keys(settingsOverrides).length} changed`, "reset now"],
-					description: "Drop this session's changes; the environment defaults apply again.",
+					description: "Drop this session's changes; the settings file and environment defaults apply again.",
 				},
 			],
 			apply: (id, value) => {
@@ -1338,6 +1341,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		budgetTracker.reset();
 		mirrorMutationSeen = false;
 		restore(ctx);
+		if (options.settingsFileWarning) ctx.ui.notify(`pi-clm: ${options.settingsFileWarning}`, "warning");
 		if (settingsWarning) ctx.ui.notify(`pi-clm: ${settingsWarning}`, "warning");
 		if (steeringError) ctx.ui.notify(`pi-clm: steering document not loaded: ${steeringError}`, "warning");
 		await replaceStore(ctx);

@@ -3,10 +3,13 @@
 Everything is optional; with no configuration, the budget is the model's context window
 and the overflow guard, calibration and reminders are on.
 
-Environment variables set the defaults for every session. The **settings** page of the
-panel (`/clm settings`) and `/clm config` change them for the current session; those
-changes are saved in the session, so they survive resume, `/reload` and `/tree`, and
-`/clm config reset` drops them.
+A settings file and environment variables set the defaults for every session. The
+**settings** page of the panel (`/clm settings`) and `/clm config` change them for the
+current session; those changes are saved in the session, so they survive resume, `/reload`
+and `/tree`, and `/clm config reset` drops them.
+
+From lowest to highest: built-in default, settings file, environment variable, session
+change.
 
 ## Settings
 
@@ -26,9 +29,36 @@ Values keep their case (paths), names do not.
 | `trailer`        | paper-harness parity: append `[context: ~N of B tokens]` to every tool result                                     | `on`, `off`                                   | off          |
 | `compact-prompt` | markdown template `/clm-compact` sends instead of the built-in prompt                                             | a path, `default`                             | built in     |
 
+## Settings file
+
+`~/.pi/agent/pi-clm/settings.json` (under `PI_CODING_AGENT_DIR` when that is set) holds
+defaults for every session. It is optional and edited by hand; pi-clm never writes it.
+Its names and values are those of `/clm config` in the table above:
+
+```json
+{
+  "budget": "200k",
+  "reminders": "75/90%",
+  "cap": "10k:0.5",
+  "steering": "house"
+}
+```
+
+- A value is a string as typed after `/clm config <setting>`; a plain number or `true` /
+  `false` also works where it reads the same (`200000`, `true`).
+- In `steering` and `compact-prompt`, `~` is the home directory and a relative path starts
+  at the settings file's directory.
+- The file is read once, when the extension loads: an edit applies on the next `/reload`.
+  A setting changed in a session keeps its session value until `/clm config reset`.
+- A mistake in the file never stops Pi from starting. An unknown setting or a value the
+  setting does not accept is skipped and the rest applies; a file that is not valid JSON is
+  ignored as a whole. Either way a warning naming the file and the setting is shown when
+  the session starts and in `/clm status` until the file is fixed.
+
 ## Environment variables
 
-These are read once, when the extension loads, and use plainer syntax than
+An environment variable that is set overrides the settings file's value for the same
+setting. These are read once, when the extension loads, and use plainer syntax than
 `/clm config`: whole numbers, no `k`/`m` suffixes, and paths rather than names.
 A value the parser does not accept stops the extension from loading, with a message
 saying which variable is wrong.

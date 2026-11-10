@@ -1,11 +1,11 @@
 /**
  * CLM settings: one table of the knobs the plugin exposes, their defaults (from the
- * environment at load, see `index.ts`), per-session overrides made from the panel or
+ * settings file and the environment at load, see `index.ts`), per-session overrides made from the panel or
  * `/clm config`, and how each is shown and parsed.
  *
  * Overrides are saved as a session entry (`pi-clm-settings`), so they are branch-local
- * and survive resume and `/reload` like the projection itself; environment variables
- * remain the defaults for new sessions.
+ * and survive resume and `/reload` like the projection itself; the settings file and
+ * environment variables remain the defaults for new sessions.
  */
 
 import { basename } from "node:path";
