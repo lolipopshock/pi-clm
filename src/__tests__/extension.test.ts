@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { describe, test } from "node:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { after, describe, test } from "node:test";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -20,6 +20,11 @@ import {
 } from "../projection.ts";
 import { LIVE_CONTEXT_STATE } from "../state.ts";
 import type { LiveContextMessage } from "../types.ts";
+
+// The entry point reads `<agent dir>/pi-clm/settings.json`; keep the developer's own file out of these tests.
+const TEST_AGENT_DIR = await mkdtemp(join(tmpdir(), "pi-clm-test-agent-"));
+process.env.PI_CODING_AGENT_DIR = TEST_AGENT_DIR;
+after(() => rm(TEST_AGENT_DIR, { recursive: true, force: true }));
 
 type Handler = (event: any, ctx: any) => any;
 
@@ -1968,6 +1973,68 @@ describe("pi-clm entry point", () => {
 		} finally {
 			if (saved === undefined) delete process.env.PI_CLM_COMPACT_PROMPT;
 			else process.env.PI_CLM_COMPACT_PROMPT = saved;
+		}
+	});
+
+	test("CLM: the settings file sets the defaults, and session changes and reset are measured against them", async () => {
+		const settingsFile = join(TEST_AGENT_DIR, "pi-clm", "settings.json");
+		await mkdir(join(TEST_AGENT_DIR, "pi-clm"), { recursive: true });
+		await writeFile(settingsFile, JSON.stringify({ budget: "200k", reminders: "off", cap: "10k" }));
+		const harness = createHarness();
+		try {
+			clmExtension(harness.pi);
+			await emit(harness, "session_start", { reason: "startup" });
+			let details = await clmSettingsText(harness);
+			assert.match(details, /Budget +200k\n/);
+			assert.match(details, /Reminders +off\n/);
+			assert.match(details, /Observation cap +10k chars\n/);
+
+			await harness.commands.get("clm").handler("config budget 50k", harness.ctx);
+			assert.match(await clmSettingsText(harness), /Budget +50k {2}\(changed\)/);
+			await harness.commands.get("clm").handler("config reset", harness.ctx);
+			details = await clmSettingsText(harness);
+			assert.match(details, /Budget +200k\n/, "reset returns to the file's default");
+			assert.equal(JSON.parse(await readFile(settingsFile, "utf8")).budget, "200k", "the file is never written");
+
+			await harness.commands.get("clm").handler("status", harness.ctx);
+			assert.doesNotMatch(harness.notifications.join("\n"), /settings file/, "a file used in full is not mentioned");
+		} finally {
+			await rm(settingsFile, { force: true });
+			await emit(harness, "session_shutdown", {});
+		}
+	});
+
+	test("CLM: a mistake in the settings file is skipped and reported at session start and in the status", async () => {
+		const settingsFile = join(TEST_AGENT_DIR, "pi-clm", "settings.json");
+		await mkdir(join(TEST_AGENT_DIR, "pi-clm"), { recursive: true });
+		const harness = createHarness();
+		try {
+			await writeFile(settingsFile, JSON.stringify({ budgte: "200k", cap: "10k" }));
+			clmExtension(harness.pi);
+			await emit(harness, "session_start", { reason: "startup" });
+			const atStart = harness.notifications.find((message) => message.startsWith("pi-clm: settings file"));
+			assert.match(atStart ?? "", /settings\.json\): ignored unknown setting "budgte"\. Settings: budget, /);
+			const details = await clmSettingsText(harness);
+			assert.match(details, /Observation cap +10k chars\n/, "the rest of the file applies");
+			assert.match(details, /Budget +model window\n/);
+			await harness.commands.get("clm").handler("status", harness.ctx);
+			assert.match(harness.notifications.at(-1)!, /⚠ settings file .*unknown setting "budgte"/);
+			// A session change does not clear it: the file is still wrong.
+			await harness.commands.get("clm").handler("config reserve 4k", harness.ctx);
+			await harness.commands.get("clm").handler("status", harness.ctx);
+			assert.match(harness.notifications.at(-1)!, /⚠ settings file /);
+
+			await writeFile(settingsFile, "{ not json");
+			const broken = createHarness();
+			clmExtension(broken.pi);
+			await emit(broken, "session_start", { reason: "startup" });
+			try {
+				assert.ok(broken.notifications.some((message) => /^pi-clm: settings file ignored .*not valid JSON/.test(message)));
+				assert.match(await clmSettingsText(broken), /Observation cap +off\n/);
+			} finally { await emit(broken, "session_shutdown", {}); }
+		} finally {
+			await rm(settingsFile, { force: true });
+			await emit(harness, "session_shutdown", {});
 		}
 	});
 

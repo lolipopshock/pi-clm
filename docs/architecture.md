@@ -300,7 +300,8 @@ an unchanged capped block is persisted in its capped form when an edit is accept
 guard, Pi compaction, observation cap, steering, one tool per turn, size trailer, compact
 prompt — with
 each one's label, description, environment variable, formatting and parsing. Defaults come
-from the extension options (the environment at load). A change from the panel or
+from the extension options (the settings file `<agent dir>/pi-clm/settings.json`, read by
+`src/settings-file.ts`, then the environment, both at load). A change from the panel or
 `/clm config <setting> <value>` is validated, stored as a `pi-clm-settings` session entry
 holding only the values that differ from the defaults, and only then applied to the running
 hooks, so a change that cannot be saved never takes effect. Stored overrides are
@@ -403,7 +404,7 @@ appears once per machine; `/clm about` puts it back in the header for the curren
 ## 10. Module map
 
 ```text
-index.ts                     entry: CLM mode + env budget policy
+index.ts                     entry: CLM mode + defaults from the settings file and environment
 src/index.ts                 Pi lifecycle: hooks, commands, tools, notices
 src/context-document.ts      render / parse / apply, role lowering, tool-group repair
 src/projection.ts            digests, prefix validation, suffix rebasing, resume recovery
@@ -422,6 +423,7 @@ src/presentation.ts          status text and system-prompt guidance
 src/timeline.ts              context-size timeline model and ASCII chart
 src/viewer.ts                /clm panel pages
 src/settings.ts              CLM settings table, overrides, parsing
+src/settings-file.ts         defaults from <agent dir>/pi-clm/settings.json
 src/compact.ts               /clm-compact prompt and template loading
 src/skills/live-context/     conservative-mode editing recipes (not loaded in CLM mode)
 src/__tests__/               unit and lifecycle tests
