@@ -36,6 +36,28 @@ describe("budget policy resolution", () => {
 		assert.equal(resolveBudget(resolveBudgetPolicy(undefined), undefined), undefined);
 		assert.equal(resolveBudget(resolveBudgetPolicy(undefined), 0), undefined);
 	});
+	test("a percentage of the model window resolves to floor(window × percent / 100)", () => {
+		const percent = resolveBudgetPolicy({ contextBudgetPercent: 80 });
+		assert.deepEqual(resolveBudget(percent, 100_000), { budget: 80_000, reserve: 2048, source: "config", budgetPercent: 80 });
+		assert.deepEqual(resolveBudget(percent, 272_000), { budget: 217_600, reserve: 2048, source: "config", budgetPercent: 80 });
+		assert.deepEqual(resolveBudget(resolveBudgetPolicy({ contextBudgetPercent: 25 }), 100_000), {
+			budget: 25_000,
+			reserve: 2048,
+			source: "config",
+			budgetPercent: 25,
+		});
+	});
+	test("a percentage needs a known window; without one there is no fixed budget", () => {
+		const percent = resolveBudgetPolicy({ contextBudgetPercent: 80 });
+		assert.equal(resolveBudget(percent, undefined), undefined);
+		assert.equal(resolveBudget(percent, 0), undefined);
+	});
+	test("a percentage is mutually exclusive with a token budget and must be in (0, 100]", () => {
+		assert.throws(() => resolveBudgetPolicy({ contextBudget: 32_000, contextBudgetPercent: 80 }), /mutually exclusive/);
+		assert.throws(() => resolveBudgetPolicy({ contextBudgetPercent: 0 }), /\(0, 100\]/);
+		assert.throws(() => resolveBudgetPolicy({ contextBudgetPercent: 100.5 }), /\(0, 100\]/);
+		assert.throws(() => resolveBudgetPolicy({ contextBudgetPercent: -5 }), /\(0, 100\]/);
+	});
 	test("reserve is clamped to the budget and colliding tiers are deduplicated", () => {
 		const tiny = resolveBudgetPolicy({ contextBudget: 1000, reserve: 5000, remindAtFractions: [0.5] });
 		const resolved = resolveBudget(tiny, undefined)!;
@@ -49,15 +71,18 @@ describe("budget policy resolution", () => {
 		assert.throws(() => resolveBudgetPolicy({ reserve: -1 }), /nonnegative/);
 		assert.throws(() => resolveBudgetPolicy({ remindAtFractions: [1.5] }), /\(0, 1\)/);
 	});
-	test("environment overrides parse numbers, fraction lists, and off", () => {
+	test("environment overrides parse numbers, percentages, fraction lists, and off", () => {
 		assert.deepEqual(budgetPolicyFromEnv({ PI_CLM_BUDGET: "16000", PI_CLM_RESERVE: "1024", PI_CLM_REMIND_AT: "0.25, 0.9" }), {
 			contextBudget: 16_000,
 			reserve: 1024,
 			remindAtFractions: [0.25, 0.9],
 		});
+		assert.deepEqual(budgetPolicyFromEnv({ PI_CLM_BUDGET: "80%" }), { contextBudgetPercent: 80 });
+		assert.deepEqual(budgetPolicyFromEnv({ PI_CLM_BUDGET: " 12.5% " }), { contextBudgetPercent: 12.5 });
 		assert.deepEqual(budgetPolicyFromEnv({ PI_CLM_REMIND_AT: "off" }), { remindAtFractions: [], remindAtReserve: false });
 		assert.deepEqual(budgetPolicyFromEnv({}), {});
 		assert.throws(() => resolveBudgetPolicy(budgetPolicyFromEnv({ PI_CLM_BUDGET: "lots" })), /positive/);
+		assert.throws(() => budgetPolicyFromEnv({ PI_CLM_BUDGET: "nope%" }), /PI_CLM_BUDGET/);
 	});
 });
 
@@ -110,6 +135,10 @@ describe("budget text", () => {
 		assert.match(text, /15,000 tokens remain/);
 		assert.match(text, /final reminder comes at 29,952 tokens/);
 		assert.match(text, /\/tmp\/m\/LIVE_CONTEXT\.md/);
+	});
+	test("summary line names a percentage budget as configured against the model window", () => {
+		const text = budgetSummaryLine({ ...reading(10_000), budget: 80_000, budgetPercent: 80 });
+		assert.match(text, /budget 80,000 tok \(configured \(80% of model window\), reserve 2,048\)/);
 	});
 	test("notice says when the observed size is unknown instead of implying a measurement", () => {
 		const text = budgetNoticeText(reading(17_000), tiers[0]!, undefined);

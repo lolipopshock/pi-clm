@@ -15,7 +15,7 @@ Values keep their case (paths), names do not.
 
 | setting          | what it controls                                                                                                  | `/clm config` values                         | default      |
 |------------------|-------------------------------------------------------------------------------------------------------------------|----------------------------------------------|--------------|
-| `budget`         | token budget the reminders and the overflow guard measure against                                                 | `200k`, `1.5m`, `200000`, or `window`         | model window |
+| `budget`         | token budget the reminders and the overflow guard measure against; either a number or a percentage of the model's context window                                            | `200k`, `1.5m`, `200000`, `80%`, or `window` | model window |
 | `reserve`        | generation headroom kept below the budget; the last reminder fires at budget − reserve                            | `2048`, `2k`                                  | `2048`       |
 | `reminders`      | budget fractions at which a `[CLM BUDGET]` note is added to the model's context                                   | `50/75/90%`, `75/90%`, `90%`, `off`           | `50/75/90%`  |
 | `guard`          | overflow guard: above budget − reserve, withhold the oldest tool results                                          | `on`, `off`                                   | `on`         |
@@ -35,7 +35,7 @@ saying which variable is wrong.
 
 | variable                    | accepted values                                                                  | sets            |
 |-----------------------------|----------------------------------------------------------------------------------|-----------------|
-| `PI_CLM_BUDGET`             | a number of tokens, e.g. `200000` (unset = the model window)                     | `budget`        |
+| `PI_CLM_BUDGET`             | a number of tokens, e.g. `200000`, or a percentage of the model window, e.g. `80%` (unset = the model window)                             | `budget`        |
 | `PI_CLM_RESERVE`            | a number of tokens, e.g. `2048`                                                  | `reserve`       |
 | `PI_CLM_REMIND_AT`          | fractions separated by commas, e.g. `0.5,0.75,0.9`; `off` or `none` for no reminders | `reminders` |
 | `PI_CLM_OVERFLOW`           | `withhold` or `off`                                                              | `guard`         |
@@ -49,7 +49,12 @@ saying which variable is wrong.
 
 ## Notes
 
-- **Budget.** The overflow guard acts above `min(budget − reserve, window − 4096 − reserve)`:
+- **Budget.** A percentage like `80%` means 80% of the model's context window, so the
+  same configuration adapts to whatever model is running: the budget is
+  `floor(window × percent / 100)`. It needs a known window; without one there is no fixed
+  budget (same as `window`). A percentage and a token count are mutually exclusive —
+  setting one clears the other. The overflow guard acts above
+  `min(budget − reserve, window − 4096 − reserve)`:
   Pi itself clamps the reply length once a request nears the window, so the guard keeps a
   request short of that point even when the budget is larger.
 - **Calibration.** Sizes are estimated at four characters per token, then corrected with

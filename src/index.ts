@@ -329,6 +329,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		const nextBudgetPolicy = resolveBudgetPolicy({
 			...options.budget,
 			contextBudget: next.budget,
+			contextBudgetPercent: next.budgetPercent,
 			reserve: next.reserve,
 			remindAtFractions: next.reminders,
 			remindAtReserve: sameReminders ? options.budget?.remindAtReserve ?? true : next.reminders.length > 0,
@@ -346,7 +347,10 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 	function activateSettings(staged: StagedSettings): void {
 		const next = staged.settings;
 		const budgetChanged =
-			next.budget !== settings.budget || next.reserve !== settings.reserve || next.reminders.join(",") !== settings.reminders.join(",");
+			next.budget !== settings.budget ||
+			next.budgetPercent !== settings.budgetPercent ||
+			next.reserve !== settings.reserve ||
+			next.reminders.join(",") !== settings.reminders.join(",");
 		budgetPolicy = staged.budgetPolicy;
 		observationCap = staged.observationCap;
 		overflowGuard = resolveOverflowGuard({ mode: next.guard });
