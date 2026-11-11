@@ -23,6 +23,13 @@ export interface BudgetPolicyConfig {
 	 * never blocked or rolled back. Defaults to the model context window when omitted.
 	 */
 	contextBudget?: number;
+	/**
+	 * Context budget as a percentage (0, 100] of the model's context window: the effective
+	 * budget is `floor(window × percent / 100)`. Mutually exclusive with `contextBudget` and
+	 * only resolvable when the window is known; without a window the budget falls back to
+	 * "follow the window" (no fixed budget).
+	 */
+	contextBudgetPercent?: number;
 	/** Generation headroom reserved below the budget. The final reminder fires at budget - reserve. */
 	reserve: number;
 	/** Fractions of the budget at which escalating reminders fire (0 < f < 1), ascending. */
@@ -57,6 +64,8 @@ export interface BudgetReading {
 	observedStale?: boolean;
 	/** Where `budget` came from, for status text. */
 	source: "config" | "model-window";
+	/** The percentage of the model window the budget was derived from, when configured that way. */
+	budgetPercent?: number;
 }
 
 /** A reminder threshold in absolute tokens plus a stable label for re-arming. */
@@ -69,6 +78,12 @@ export function resolveBudgetPolicy(overrides: Partial<BudgetPolicyConfig> | und
 	const merged: BudgetPolicyConfig = { ...DEFAULT_BUDGET_POLICY, ...(overrides ?? {}) };
 	if (merged.contextBudget !== undefined && (!Number.isFinite(merged.contextBudget) || merged.contextBudget <= 0)) {
 		throw new Error(`contextBudget must be a positive number of tokens, got ${String(merged.contextBudget)}`);
+	}
+	if (merged.contextBudgetPercent !== undefined && (!Number.isFinite(merged.contextBudgetPercent) || merged.contextBudgetPercent <= 0 || merged.contextBudgetPercent > 100)) {
+		throw new Error(`contextBudgetPercent must be in (0, 100], got ${String(merged.contextBudgetPercent)}`);
+	}
+	if (merged.contextBudget !== undefined && merged.contextBudgetPercent !== undefined) {
+		throw new Error("contextBudget and contextBudgetPercent are mutually exclusive; set only one");
 	}
 	if (!Number.isFinite(merged.reserve) || merged.reserve < 0) {
 		throw new Error(`reserve must be a nonnegative number of tokens, got ${String(merged.reserve)}`);
@@ -93,10 +108,21 @@ export function estimateFactorFromEnv(env: NodeJS.ProcessEnv = process.env): num
 	return value;
 }
 
+/**
+ * `PI_CLM_BUDGET` may be a whole number of tokens (`200000`, matching `contextBudget`) or a
+ * percentage of the model's context window (`80%`, matching `contextBudgetPercent`).
+ */
 export function budgetPolicyFromEnv(env: NodeJS.ProcessEnv = process.env): Partial<BudgetPolicyConfig> {
 	const overrides: Partial<BudgetPolicyConfig> = {};
 	const budget = env.PI_CLM_BUDGET?.trim();
-	if (budget) overrides.contextBudget = Number(budget);
+	if (budget) {
+		if (budget.endsWith("%")) overrides.contextBudgetPercent = Number(budget.slice(0, -1).trim());
+		else overrides.contextBudget = Number(budget);
+	}
+	if (overrides.contextBudgetPercent !== undefined && !Number.isFinite(overrides.contextBudgetPercent)) {
+		// resolveBudgetPolicy would report the same value; fail fast with the raw text.
+		throw new Error(`PI_CLM_BUDGET percent must be a number followed by %, got ${budget}`);
+	}
 	const reserve = env.PI_CLM_RESERVE?.trim();
 	if (reserve) overrides.reserve = Number(reserve);
 	const remind = env.PI_CLM_REMIND_AT?.trim();
@@ -111,7 +137,24 @@ export function budgetPolicyFromEnv(env: NodeJS.ProcessEnv = process.env): Parti
 	return overrides;
 }
 
-export function resolveBudget(policy: BudgetPolicyConfig, modelContextWindow: number | undefined): Pick<BudgetReading, "budget" | "reserve" | "source"> | undefined {
+export function resolveBudget(
+	policy: BudgetPolicyConfig,
+	modelContextWindow: number | undefined,
+): Pick<BudgetReading, "budget" | "reserve" | "source" | "budgetPercent"> | undefined {
+	if (policy.contextBudgetPercent !== undefined) {
+		// A percentage needs a window to mean anything; without one there is no fixed budget,
+		// exactly like "follow the model window".
+		if (modelContextWindow !== undefined && Number.isFinite(modelContextWindow) && modelContextWindow > 0) {
+			const budget = Math.max(1, Math.floor((modelContextWindow * policy.contextBudgetPercent) / 100));
+			return {
+				budget,
+				reserve: Math.min(policy.reserve, budget),
+				source: "config",
+				budgetPercent: policy.contextBudgetPercent,
+			};
+		}
+		return undefined;
+	}
 	if (policy.contextBudget !== undefined) {
 		return { budget: policy.contextBudget, reserve: Math.min(policy.reserve, policy.contextBudget), source: "config" };
 	}
@@ -179,8 +222,14 @@ function formatTokens(value: number): string {
 
 /** One line for status/footer: `budget 32,000 tok (config) · est 12,345 · obs 11,900`. */
 export function budgetSummaryLine(reading: BudgetReading): string {
+	const origin =
+		reading.source === "config"
+			? reading.budgetPercent !== undefined
+				? `configured (${reading.budgetPercent}% of model window)`
+				: "configured"
+			: "model window";
 	const parts = [
-		`budget ${formatTokens(reading.budget)} tok (${reading.source === "config" ? "configured" : "model window"}, reserve ${formatTokens(reading.reserve)})`,
+		`budget ${formatTokens(reading.budget)} tok (${origin}, reserve ${formatTokens(reading.reserve)})`,
 		`estimated next request ${formatTokens(reading.estimated)}${reading.calibration !== undefined && reading.calibration > 1.005 ? ` (×${reading.calibration.toFixed(2)} calibrated)` : ""}`,
 	];
 	parts.push(

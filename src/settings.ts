@@ -18,6 +18,12 @@ export const CLM_SETTINGS_ENTRY = "pi-clm-settings";
 export interface ClmSettings {
 	/** Context budget in tokens; undefined follows the model window. */
 	budget?: number;
+	/**
+	 * Context budget as a percentage (0, 100] of the model's context window, e.g. 80 means
+	 * 80% of the window. Mutually exclusive with `budget`: setting one unsets the other, and
+	 * the effective budget is floor(window × percent / 100) when the window is known.
+	 */
+	budgetPercent?: number;
 	reserve: number;
 	/** Reminder fractions of the budget; empty disables reminders (including the reserve one). */
 	reminders: number[];
@@ -45,7 +51,7 @@ export interface ClmSettingsEntry {
 }
 
 export function defaultClmSettings(input: {
-	budget?: { contextBudget?: number; reserve?: number; remindAtFractions?: readonly number[] };
+	budget?: { contextBudget?: number; contextBudgetPercent?: number; reserve?: number; remindAtFractions?: readonly number[] };
 	overflow?: { mode?: "withhold" | "off" };
 	nativeCompaction?: "auto" | "off" | "on";
 	observationCap?: { maxCharacters?: number; headFraction?: number };
@@ -56,6 +62,7 @@ export function defaultClmSettings(input: {
 }): ClmSettings {
 	return {
 		budget: input.budget?.contextBudget,
+		budgetPercent: input.budget?.contextBudgetPercent,
 		reserve: input.budget?.reserve ?? DEFAULT_BUDGET_POLICY.reserve,
 		reminders: [...(input.budget?.remindAtFractions ?? DEFAULT_BUDGET_POLICY.remindAtFractions)],
 		guard: input.overflow?.mode ?? "withhold",
@@ -89,6 +96,7 @@ const isPath = (value: unknown) => value === null || (typeof value === "string" 
 /** What each stored override may hold; the same limits the budget, cap and guard resolvers enforce. */
 const VALID_OVERRIDE: Record<keyof ClmSettings, (value: unknown) => boolean> = {
 	budget: (value) => value === null || (isNumber(value) && value > 0),
+	budgetPercent: (value) => value === null || (isNumber(value) && value > 0 && value <= 100),
 	reserve: (value) => isNumber(value) && value >= 0,
 	reminders: (value) => Array.isArray(value) && value.every((fraction) => isNumber(fraction) && fraction > 0 && fraction < 1),
 	guard: (value) => value === "withhold" || value === "off",
@@ -178,16 +186,27 @@ export const CLM_SETTINGS: readonly ClmSettingDescriptor[] = [
 	{
 		key: "budget",
 		label: "Budget",
-		description: "Token budget reminders and the overflow guard measure against. Type a number (200k) or \"window\" to follow the model. Env: PI_CLM_BUDGET.",
-		placeholder: "200k, or window",
-		format: (settings, { modelWindow }) =>
-			settings.budget !== undefined
-				? formatTokens(settings.budget)
-				: `model window${modelWindow ? ` (${formatTokens(modelWindow)})` : ""}`,
+		description: "Token budget reminders and the overflow guard measure against. Type a number (200k), a percentage of the model window (80%), or \"window\" to follow the model. Env: PI_CLM_BUDGET.",
+		placeholder: "200k, 80%, or window",
+		format: (settings, { modelWindow }) => {
+			if (settings.budgetPercent !== undefined) {
+				const effective = modelWindow ? Math.floor((modelWindow * settings.budgetPercent) / 100) : undefined;
+				return `${settings.budgetPercent}% of window${effective !== undefined ? ` (${formatTokens(effective)})` : ""}`;
+			}
+			if (settings.budget !== undefined) return formatTokens(settings.budget);
+			return `model window${modelWindow ? ` (${formatTokens(modelWindow)})` : ""}`;
+		},
 		parse: (text) => {
 			const value = text.trim().toLowerCase();
-			if (["window", "model", "default", "off", ""].includes(value)) return { budget: null };
-			return { budget: parseTokenCount(value) };
+			if (["window", "model", "default", "off", ""].includes(value)) return { budget: null, budgetPercent: null };
+			if (value.endsWith("%")) {
+				const percent = Number(value.slice(0, -1).trim());
+				if (!Number.isFinite(percent) || percent <= 0 || percent > 100) {
+					throw new Error(`budget percent must be in (0, 100], got "${text}"`);
+				}
+				return { budget: null, budgetPercent: percent };
+			}
+			return { budget: parseTokenCount(value), budgetPercent: null };
 		},
 	},
 	{
