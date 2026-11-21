@@ -54,7 +54,10 @@ export interface WithheldRecord {
 	message: LiveContextMessage;
 	toolCallId: string;
 	toolName: string;
+	/** Calibrated estimate; moves between requests as the calibration is re-fit. */
 	tokens: number;
+	/** Characters ÷ 4 of the withheld text: depends on the text alone, so it is safe to print in the note. */
+	noteTokens: number;
 	file?: string;
 }
 
@@ -80,10 +83,17 @@ function toolResultText(message: LiveContextMessage): string {
 		.join("\n");
 }
 
-/** Short by design: notes accumulate, so each costs as little context as possible. */
+/**
+ * Short by design: notes accumulate, so each costs as little context as possible.
+ *
+ * The text must be the same on every request for the same withheld result. Notes replace
+ * the oldest tool results, so a note that changes invalidates the provider's prefix cache
+ * for everything after it. Print nothing here that depends on the calibration, the
+ * request size, or the limit.
+ */
 export function withheldNoteText(record: Omit<WithheldRecord, "message">, _estimated: number, _limit: number): string {
 	const where = record.file ? ` Full text: ${record.file}` : " Full text remains in the session history.";
-	return `[pi-clm overflow guard] ${record.toolName}#${record.toolCallId} (~${record.tokens.toLocaleString("en-US")} tok) withheld over budget.${where}`;
+	return `[pi-clm overflow guard] ${record.toolName}#${record.toolCallId} (~${record.noteTokens.toLocaleString("en-US")} tok) withheld over budget.${where}`;
 }
 
 const withheldCache = new WeakMap<LiveContextMessage, LiveContextMessage>();
@@ -142,6 +152,7 @@ export function applyOverflowGuard(messages: LiveContextMessage[], options: Appl
 			toolCallId: String(source.toolCallId ?? "unknown"),
 			toolName: String(source.toolName ?? "tool"),
 			tokens,
+			noteTokens: Math.ceil(toolResultText(source).length / 4),
 			file,
 		};
 		let note = withheldCache.get(source);

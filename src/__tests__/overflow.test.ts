@@ -66,6 +66,22 @@ describe("overflow guard", () => {
 		assert.deepEqual(r2.withheld.map((w) => w.toolCallId), ["b"]);
 		assert.equal(r2.messages[3], reread, "the re-read stays visible");
 	});
+	test("note text for a tool call is identical across context builds with different calibration", () => {
+		// Pi hands the extension fresh message objects on every request, and the calibration
+		// factor is re-fit between requests. Neither may change a note: it sits early in the
+		// request, so a changed note invalidates the provider's prefix cache after it.
+		const messages = [user, tool("a", 4000), tool("b", 4000), tool("c", 4000)];
+		const build = (factor: number) => {
+			const calibrated = (ms: LiveContextMessage[]) => Math.ceil(estimate(ms) * factor);
+			const result = applyOverflowGuard(structuredClone(messages), { limit: 1_100, fixedTokens: 0, estimate: calibrated });
+			return result.messages.slice(1, 3).map((m) => JSON.stringify(m.content));
+		};
+		const first = build(1.3);
+		const second = build(1.27);
+		assert.match(first[0]!, /overflow guard\] read#a /);
+		assert.match(first[1]!, /overflow guard\] read#b /);
+		assert.deepEqual(second, first);
+	});
 	test("notice names the results, the limit and whether it now fits", () => {
 		const messages = [user, tool("a", 4000)];
 		const result = applyOverflowGuard(messages, { limit: 500, fixedTokens: 100, estimate });
