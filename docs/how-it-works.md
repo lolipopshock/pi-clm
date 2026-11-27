@@ -44,13 +44,24 @@ discard the model's edits. Manual `/compact` still works, but it summarizes the 
 history and resets the projection; `/clm-compact` instead asks the model to do the
 compaction by editing its mirror, with a fixed prompt you can replace.
 
+## Compute accounting
+
+pi-clm also counts the compute of every request as **prefix-reuse FLOPs**, the cost
+measure of [Context Language Models](https://arxiv.org/abs/2609.37725): a server with
+prefix caching reuses the longest leading part of the prompt it has already seen and
+prefills only the rest, so an edit in the middle of the context costs a re-prefill of
+everything after it. Each request is recorded in the session (`pi-clm-flops` entries, also
+printed by `--mode json`), each run ends with a `pi-clm-flops-summary` entry, and
+`/clm status` and the overview show the running total. This is bookkeeping only; nothing
+is sent to the model. See [configuration.md](configuration.md#prefix-reuse-flops).
+
 ## The panel
 
 `/clm` opens the panel; `/clm overview|input|edits|settings` opens a page directly
 (outside the TUI it prints the page). `1–4` or `Tab` switch pages, `q` closes.
 
-- **overview** — context size per request, the budget as a dashed line, and the points
-  where an edit was accepted. It opens on the latest request; `← →` step through
+- **overview** — context size per request, the budget as a dashed line, the points
+  where an edit was accepted, and the prefix-reuse FLOPs so far. It opens on the latest request; `← →` step through
   compaction points (the chart pans to keep the selection centred) and back to now; `z`
   cycles the x axis between **all** (the whole history fitted into the width, the default;
   peak per bucket), **detail** (one column per request, panning) and **turns** (one column

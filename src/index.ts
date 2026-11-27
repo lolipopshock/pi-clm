@@ -49,6 +49,17 @@ import {
 	type BudgetPolicyConfig,
 	type BudgetReading,
 } from "./budget.ts";
+import {
+	DEFAULT_FLOPS_CONFIG,
+	formatFlops,
+	isFlopsRequestRecord,
+	PREFIX_REUSE_FLOPS_ENTRY,
+	PREFIX_REUSE_FLOPS_SUMMARY_ENTRY,
+	PrefixReuseMeter,
+	resolveFlopsConstants,
+	type FlopsConfig,
+	type ResponseUsage,
+} from "./flops.ts";
 import { classifyMirrorToolCall } from "./mirror-guard.ts";
 import { capObservations, resolveObservationCap, type ObservationCapPolicy } from "./observation.ts";
 import {
@@ -236,6 +247,11 @@ export interface LiveContextExtensionOptions {
 	 * never write the marker file (`<agent dir>/pi-clm/welcomed` unless `markerPath` is given).
 	 */
 	banner?: { enabled?: boolean; markerPath?: string };
+	/**
+	 * Prefix-reuse FLOPs accounting (`src/flops.ts`): model constants, or `model: "off"`.
+	 * Accounting only; it never changes a request.
+	 */
+	flops?: Partial<FlopsConfig>;
 }
 
 export default function liveContextExtension(pi: ExtensionAPI, options: LiveContextExtensionOptions = {}): void {
@@ -260,6 +276,8 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 	let revivalFailedAt: number | undefined;
 	const pressure = new PressureTracker();
 	const continuitySize = new ContinuitySizeTracker();
+	const flopsConfig: FlopsConfig = { ...DEFAULT_FLOPS_CONFIG, ...(options.flops ?? {}) };
+	const flopsMeter = flopsConfig.model === "off" ? undefined : new PrefixReuseMeter();
 	let budgetPolicy = resolveBudgetPolicy(options.budget);
 	let observationCap = resolveObservationCap(options.observationCap);
 	let overflowGuard = resolveOverflowGuard(options.overflow);
@@ -509,7 +527,18 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 			? ` · last ${state.lastOutcome.kind === "applied" ? "edit" : state.lastOutcome.kind} ${new Date(state.lastOutcome.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
 			: " · no edits yet";
 		const messages = raw !== undefined && sent !== undefined ? `messages ~${formatTokens(sent)} sent of ~${formatTokens(raw)} raw${saved}` : "no messages yet";
-		return [head, `${messages}${outcome}`, `${settingsSummary(ctx)} · /clm for the panel`, ...warnings()].join("\n");
+		const compute = flopsStatusLine();
+		return [head, `${messages}${outcome}`, `${settingsSummary(ctx)} · /clm for the panel`, ...(compute ? [compute] : []), ...warnings()].join("\n");
+	}
+
+	/** `prefix-reuse 1.19 PFLOP over 6 requests · reused 49.5k of 69.1k prompt tok`, once a request is counted. */
+	function flopsStatusLine(): string | undefined {
+		const totals = flopsMeter?.totals;
+		if (!totals || totals.requests === 0) return undefined;
+		const flops = totals.requestsWithoutFlops === totals.requests
+			? "prefix-reuse FLOPs: no model constants (PI_CLM_FLOPS_MODEL)"
+			: `prefix-reuse ${formatFlops(totals.flops)}`;
+		return `${flops} over ${totals.requests} request${totals.requests === 1 ? "" : "s"} · reused ${formatTokens(totals.reusedPrefixTokens)} of ${formatTokens(totals.promptTokens)} prompt tok`;
 	}
 
 	/** Grouped details: the text form of the panel's settings page. */
@@ -687,6 +716,11 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		lastBudgetReading = undefined;
 		projectionReplaced = false;
 		calibrator.reset();
+		flopsMeter?.restore(
+			branch.flatMap((entry) =>
+				entry.type === "custom" && entry.customType === PREFIX_REUSE_FLOPS_ENTRY && isFlopsRequestRecord(entry.data) ? [entry.data] : [],
+			),
+		);
 		updateStatus(ctx);
 	}
 
@@ -1629,6 +1663,33 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		maxTokensLifts += 1;
 		return patched;
 	});
+
+	// Prefix-reuse FLOPs (src/flops.ts): observe each payload as sent and the usage of its
+	// response. Accounting only — these handlers never return a change.
+	if (flopsMeter) {
+		pi.on("before_provider_request", (event) => {
+			flopsMeter.observeRequest(event.payload);
+			return undefined;
+		});
+
+		pi.on("message_end", (event, ctx) => {
+			const message = event.message as { role?: string; usage?: ResponseUsage; model?: string; timestamp?: number | string };
+			if (message?.role !== "assistant") return undefined;
+			const model = ctx.model?.id ?? message.model;
+			const at = message.timestamp === undefined ? undefined : new Date(message.timestamp);
+			const record = flopsMeter.observeResponse(message.usage, {
+				model,
+				at: at && !Number.isNaN(at.valueOf()) ? at.toISOString() : undefined,
+				constants: resolveFlopsConstants(flopsConfig, model),
+			});
+			if (record) pi.appendEntry(PREFIX_REUSE_FLOPS_ENTRY, record);
+			return undefined;
+		});
+
+		pi.on("agent_end", () => {
+			if (flopsMeter.totals.requests > 0) pi.appendEntry(PREFIX_REUSE_FLOPS_SUMMARY_ENTRY, flopsMeter.summary());
+		});
+	}
 
 	pi.on("tool_result", (event, ctx) => {
 		if (!sizeTrailer || !state.enabled) return undefined;

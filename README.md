@@ -29,7 +29,7 @@ pi -e git:github.com/lolipopshock/pi-clm
 | command | what it does |
 |---------|--------------|
 | `/clm` | open the panel: **overview** (context size over time + compaction points) <br><img src=".github/images/overview.png" alt="The overview page: context size per request, with two points where the model compacted its own context" width="720"> <br> **input** (what the next request contains) · **edits** (per-revision side-by-side diff) <br><img src=".github/images/edits.png" alt="The edits page: a tool result before and after the model shortened it" width="720">|
-| `/clm status` | three lines: next request vs budget, edits, changed settings |
+| `/clm status` | three lines: next request vs budget, edits, changed settings (plus prefix-reuse FLOPs once a request is counted) |
 | `/clm config` | open **settings**; `/clm config <setting> <value>` changes one, `/clm config reset` drops this session's changes<br><img src=".github/images/settings.png" alt="The settings page: sizes, guard, files, and every setting" width="720"> |
 | `/clm-compact [instructions]` | ask the model to compact its own context now; anything you add (e.g. what to keep) is passed along. The result shows on the **edits** page |
 | `/clm on` / `off` / `reset` | enable, use raw context, discard the projection |

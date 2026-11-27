@@ -1823,6 +1823,76 @@ describe("pi-clm entry point", () => {
 		} finally { await emit(harness, "session_shutdown", {}); }
 	});
 
+	test("CLM: prefix-reuse FLOPs are recorded per request and per run without touching the payload, and survive resume", async () => {
+		const harness = createHarness();
+		liveContextExtension(harness.pi, { editingMode: "clm", flops: { model: "27b" } });
+		harness.ctx.model = { id: "qwen3.6-27b", contextWindow: 65_536, maxTokens: 4096 };
+		harness.ctx.getSystemPrompt = () => "";
+		await emit(harness, "session_start", { reason: "startup" });
+		try {
+			const user = { role: "user", content: "question" };
+			const call = { role: "assistant", content: "searching", tool_calls: [{ id: "c1", type: "function", function: { name: "search", arguments: "{}" } }] };
+			const toolResult = { role: "tool", tool_call_id: "c1", content: "result" };
+			const request = async (messages: unknown[], usage: Record<string, number>, timestamp: number) => {
+				const payload = { model: "qwen3.6-27b", messages, tools: [{ type: "function", function: { name: "search" } }], max_tokens: 4096 };
+				const before = JSON.stringify(payload);
+				const results = await emit(harness, "before_provider_request", { type: "before_provider_request", payload });
+				assert.ok(results.every((value) => value === undefined), "accounting never replaces the payload");
+				assert.equal(JSON.stringify(payload), before, "accounting never mutates the payload");
+				await emit(harness, "message_end", {
+					type: "message_end",
+					message: { role: "assistant", content: [], usage: { ...usage, totalTokens: 0, cost: { total: 0 } }, stopReason: "toolUse", timestamp },
+				});
+			};
+			await request([user], { input: 1000, cacheRead: 0, cacheWrite: 0, output: 100 }, 1_000);
+			await request([user, call, toolResult], { input: 300, cacheRead: 1000, cacheWrite: 0, output: 50 }, 2_000);
+			await emit(harness, "message_end", { type: "message_end", message: { role: "toolResult", content: [] } });
+			await emit(harness, "agent_end", { type: "agent_end", messages: [] });
+
+			const records = harness.branch.filter((entry) => entry.customType === "pi-clm-flops").map((entry) => entry.data);
+			assert.equal(records.length, 2);
+			assert.deepEqual(
+				records.map((r: any) => [r.request, r.promptTokens, r.reusedPrefixTokens, r.newPromptTokens, r.outputTokens, r.serverCachedTokens]),
+				[[1, 1000, 0, 1000, 100, 0], [2, 1300, 1000, 300, 50, 1000]],
+			);
+			assert.equal(records[1].at, new Date(2_000).toISOString());
+			assert.equal(records[1].cumulative.flops, records[0].flops + records[1].flops);
+			const summary = harness.branch.filter((entry) => entry.customType === "pi-clm-flops-summary").map((entry) => entry.data);
+			assert.equal(summary.length, 1);
+			assert.equal(summary[0].totals.flops, records[1].cumulative.flops);
+			assert.equal(summary[0].constants.source, "27b");
+
+			await harness.commands.get("clm").handler("status", harness.ctx);
+			assert.match(harness.notifications.at(-1)!, /prefix-reuse [0-9.]+ [PT]FLOP over 2 requests · reused 1k of 2\.3k prompt tok/);
+
+			// Resume: totals and reuse history come back from the session entries.
+			const resumed = createHarness([...harness.branch]);
+			liveContextExtension(resumed.pi, { editingMode: "clm", flops: { model: "27b" } });
+			resumed.ctx.model = harness.ctx.model;
+			resumed.ctx.getSystemPrompt = () => "";
+			await emit(resumed, "session_start", { reason: "resume" });
+			try {
+				await emit(resumed, "before_provider_request", {
+					type: "before_provider_request",
+					payload: { model: "qwen3.6-27b", messages: [user, call, toolResult, { role: "assistant", content: "done" }], tools: [{ type: "function", function: { name: "search" } }], max_tokens: 4096 },
+				});
+				await emit(resumed, "message_end", {
+					type: "message_end",
+					message: { role: "assistant", content: [], usage: { input: 1400, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { total: 0 } }, stopReason: "stop", timestamp: 3_000 },
+				});
+				const third = resumed.branch.filter((entry) => entry.customType === "pi-clm-flops").at(-1)!.data;
+				assert.deepEqual([third.request, third.reusedPrefixTokens, third.cumulative.requests], [3, 1300, 3]);
+			} finally { await emit(resumed, "session_shutdown", {}); }
+		} finally { await emit(harness, "session_shutdown", {}); }
+	});
+
+	test("CLM: PI_CLM_FLOPS_MODEL=off registers no accounting", async () => {
+		const harness = createHarness();
+		liveContextExtension(harness.pi, { editingMode: "clm", flops: { model: "off" } });
+		assert.equal(harness.handlers.get("message_end"), undefined);
+		assert.equal(harness.handlers.get("agent_end"), undefined);
+	});
+
 	test("CLM: /clm-compact sends a fixed prompt asking the model to compact its own context", async (t) => {
 		const harness = createHarness();
 		liveContextExtension(harness.pi, { editingMode: "clm", budget: { contextBudget: 100_000 } });

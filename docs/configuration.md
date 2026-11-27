@@ -46,6 +46,9 @@ saying which variable is wrong.
 | `PI_CLM_SIZE_TRAILER`       | `1`, `true`, `on` or `yes`; anything else is off                                 | `trailer`       |
 | `PI_CLM_COMPACT_PROMPT`     | a path to a markdown template; `default`, `none` or `off` for the built-in prompt | `compact-prompt` |
 | `PI_CLM_ESTIMATE_FACTOR`    | a number from 1 to 4: the prior for the size calibration (dense data: `2`)        | —               |
+| `PI_CLM_FLOPS_MODEL`        | `auto` (default), `27b`, `9b`, or `off` (no accounting)                          | —               |
+| `PI_CLM_FLOPS_PER_TOKEN`    | FLOPs per processed token, e.g. `48.7064e9`; with `PI_CLM_FLOPS_PER_PAIR`, overrides the preset | — |
+| `PI_CLM_FLOPS_PER_PAIR`     | FLOPs per attention query–key pair, e.g. `393216`; set together with the above    | —               |
 
 ## Notes
 
@@ -64,3 +67,51 @@ saying which variable is wrong.
   `/clm-compact` is always included.
 - **Parity switches** exist to compare with the paper's harness, which allows one tool call
   per turn and shows the context size in every observation. Leave them off for normal use.
+
+## Prefix-reuse FLOPs
+
+Every request's compute is recorded as prefix-reuse FLOPs, the cost measure of
+[Context Language Models](https://arxiv.org/abs/2609.37725) (appendix "Prefix-Reuse FLOPs
+Computation"; reference implementation in the
+[research codebase](https://github.com/facebookresearch/context-language-models/blob/main/clm/clm_harness/flops_metrics/kv_cache_flops.py)).
+At request *t* the prompt has *P* tokens and the model generates *G*. The reused prefix *R*
+is the longest run of leading prompt units — the tool definitions, then each message —
+that also led an earlier request of the session; *U = P − R* tokens are prefilled. The
+request costs
+
+```text
+F = C_token · (U + G) + C_attn · ((P² − R²)/2 + G·P + G²/2)
+```
+
+and the run costs the sum. *P* and *G* are the provider's counts. A message's token weight
+is fixed when it first appears (the new messages of a request share its *U* in proportion
+to their serialized length), so an append-only turn reuses exactly the previous prompt.
+
+The count is **idealised**: it does not depend on what a particular server kept in its
+cache. When the provider reports cache hits (`prompt_tokens_details.cached_tokens` on
+OpenAI-compatible servers, e.g. vLLM with `--enable-prompt-tokens-details`), they are
+recorded beside it as `serverCachedTokens` and never used in the metric.
+
+**Constants.** `C_token` is two FLOPs per non-embedding parameter; `C_attn` is
+4 × full-attention layers × query heads × head dimension. With `PI_CLM_FLOPS_MODEL=auto`
+(the default) a Qwen3.5-or-later model id that names a preset size picks it
+(`qwen3.6-27b`, `Qwen/Qwen3.8-27B` → `27b`); any other model gets token counts but no FLOPs
+until a preset or explicit constants are set.
+
+| preset | `C_token` | `C_attn` | models |
+|--------|-----------|----------|--------|
+| `27b`  | 2 × 24.3532e9 | 4 × 16 × 6144 | Qwen3.5/3.6-27B and later 27B models of that architecture |
+| `9b`   | 2 × 6.9196e9  | 4 × 8 × 4096  | Qwen3.5-9B |
+
+**Where it is recorded.**
+
+- `pi-clm-flops` session entry per request: `promptTokens`, `reusedPrefixTokens`,
+  `newPromptTokens`, `outputTokens`, `serverCachedTokens` (when reported), `flops` (with its
+  `linearFlops` and `attentionFlops` parts), `constants`, and `cumulative` totals for the
+  branch so far. With `--mode json` each entry is also printed as an `entry_appended` event.
+- `pi-clm-flops-summary` session entry at the end of every agent run: the branch totals.
+- `/clm status` (one extra line once a request is counted) and the **overview** page.
+
+Responses without a prompt count (failed or aborted requests) are not counted. Totals and
+reuse history are rebuilt from the entries on resume and `/tree`. The mirror never contains
+any of this.
