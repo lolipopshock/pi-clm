@@ -31,9 +31,11 @@ import { steeringPathFromEnv } from "./src/steering.ts";
  * - PI_CLM_NATIVE_COMPACTION — "auto" (default): cancel Pi's threshold compaction while a
  *   budget is enforced by the overflow guard; "off": cancel all automatic compaction;
  *   "on": Pi default.
- * - PI_CLM_FLOPS_MODEL / PI_CLM_FLOPS_PER_TOKEN / PI_CLM_FLOPS_PER_PAIR — prefix-reuse FLOPs
- *   accounting: model preset ("auto" from the model id, "27b", "9b", or "off") or explicit
- *   constants; recorded in session entries, never sent to the model.
+ * - PI_CLM_FLOPS_MODEL / PI_CLM_FLOPS_PER_TOKEN / PI_CLM_FLOPS_PER_PAIR / PI_CLM_FLOPS_SOURCE —
+ *   prefix-reuse FLOPs accounting: model preset ("auto" from the model id, "27b", "9b", or
+ *   "off") or explicit constants, and the headline source ("auto": server cached tokens when
+ *   reported, else prefix match; "server"; "prefix"); recorded in session entries, never sent
+ *   to the model.
  */
 function flagFromEnv(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
 	const raw = env[name]?.trim().toLowerCase();

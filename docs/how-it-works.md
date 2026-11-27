@@ -50,7 +50,8 @@ pi-clm also counts the compute of every request as **prefix-reuse FLOPs**, the c
 measure of [Context Language Models](https://arxiv.org/abs/2609.37725): a server with
 prefix caching reuses the longest leading part of the prompt it has already seen and
 prefills only the rest, so an edit in the middle of the context costs a re-prefill of
-everything after it. Each request is recorded in the session (`pi-clm-flops` entries, also
+everything after it. The reused part comes from the server's cache-hit count when it reports
+one, and from pi-clm's own prefix match otherwise; both are recorded. Each request is recorded in the session (`pi-clm-flops` entries, also
 printed by `--mode json`), each run ends with a `pi-clm-flops-summary` entry, and
 `/clm status` and the overview show the running total. This is bookkeeping only; nothing
 is sent to the model. See [configuration.md](configuration.md#prefix-reuse-flops).

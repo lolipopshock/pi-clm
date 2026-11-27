@@ -4,27 +4,35 @@
  * FLOPs Computation") and implemented in the research codebase
  * (facebookresearch/context-language-models, clm/clm_harness/flops_metrics/kv_cache_flops.py).
  *
- * At request t the prompt holds P_t tokens and the model generates G_t. The reused prefix
- * R_t is the longest run of leading prompt units (the tool definitions, then each message)
- * that also led the prompt of an earlier request in this session; only U_t = P_t − R_t
- * tokens are prefilled. An edit in the middle of the context therefore re-prefills
- * everything from the edited message onward. The turn costs
+ * At request t the prompt holds P_t tokens and the model generates G_t; R_t prompt tokens are
+ * served from a reused prefix and U_t = P_t − R_t are prefilled. The turn costs
  *
  *   F_t = C_token·(U_t + G_t) + C_attn·[(P_t² − R_t²)/2 + G_t·P_t + G_t²/2]
  *
  * with C_token the per-token cost of the linear layers and C_attn the cost per
  * query–key pair of the full-attention layers. The rollout's cost is Σ F_t.
  *
- * The count is idealised: it does not depend on what a particular server actually kept in
- * its cache (eviction, block granularity). The server's own `cached_tokens`, when it reports
- * them, are recorded beside it for comparison and never used in the metric.
+ * R_t comes from two sources, both recorded for every request:
  *
- * Token weights. P_t and G_t are the provider's counts. Each prompt unit gets a token weight
- * the first time it appears: the unmatched units of a request share U_t in proportion to
- * their serialized length. A matched prefix then weighs exactly what the earlier requests
- * were charged for it, so an append-only turn reuses exactly the previous prompt and the
- * weights of a request always sum to its P_t. Only the split of a single request's new
- * tokens between its new messages is approximate.
+ * - **server cached tokens** — the provider's own count of prompt tokens served from its
+ *   prefix cache (`prompt_tokens_details.cached_tokens`, Pi's `usage.cacheRead`). The research
+ *   code uses this first whenever every step reports it.
+ * - **prefix match** — the longest run of leading prompt units (tool definitions and system
+ *   fields, then each message) that also led an earlier request of this session, mirroring
+ *   the research code's fallback at message granularity. Always available.
+ *
+ * The headline follows the research code's priority: the server count when every request so
+ * far reported it, else the prefix match (`PI_CLM_FLOPS_SOURCE` can force either). Pi's
+ * OpenAI-compatible providers turn a missing cache count into 0, so in `auto` the server
+ * count is trusted only once some request reported a positive value; a server that never
+ * reports cache hits would otherwise look like a run without any reuse.
+ *
+ * Prefix-match token weights. P_t and G_t are the provider's counts. Weights live on the
+ * trie of unit paths: a request's matched path weighs what earlier requests were charged for
+ * it, and the new nodes share U_t in proportion to their serialized length. The weights along
+ * a request's path therefore sum to its P_t (unless the matched part alone exceeds P_t, when
+ * R_t is clamped to P_t), and an append-only turn reuses exactly the previous prompt. Only the
+ * split of one request's new tokens between its new messages is approximate.
  *
  * Accounting only: nothing here changes a request.
  */
@@ -57,17 +65,25 @@ export const FLOPS_PRESETS: Readonly<Record<string, Omit<FlopsConstants, "source
 	"9b": { perToken: 2 * 6.9196e9, perAttentionPair: 4 * 8 * 4096 },
 };
 
+export type FlopsSourceMode = "auto" | "server" | "prefix";
+export type FlopsSource = "server-cached-tokens" | "prefix-match";
+
 export interface FlopsConfig {
 	/** `auto` picks a preset from the model id; `off` disables the accounting. */
 	model: "auto" | "off" | keyof typeof FLOPS_PRESETS;
 	/** Explicit constants; take precedence over any preset. Both must be set together. */
 	perToken?: number;
 	perAttentionPair?: number;
+	/** Which reused-prefix count the headline uses; both are always recorded. */
+	source: FlopsSourceMode;
 }
 
-export const DEFAULT_FLOPS_CONFIG: FlopsConfig = { model: "auto" };
+export const DEFAULT_FLOPS_CONFIG: FlopsConfig = { model: "auto", source: "auto" };
 
-/** `PI_CLM_FLOPS_MODEL` (auto | 27b | 9b | off), `PI_CLM_FLOPS_PER_TOKEN`, `PI_CLM_FLOPS_PER_PAIR`. */
+/**
+ * `PI_CLM_FLOPS_MODEL` (auto | 27b | 9b | off), `PI_CLM_FLOPS_PER_TOKEN`, `PI_CLM_FLOPS_PER_PAIR`,
+ * `PI_CLM_FLOPS_SOURCE` (auto | server | prefix).
+ */
 export function flopsConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Partial<FlopsConfig> {
 	const config: Partial<FlopsConfig> = {};
 	const model = env.PI_CLM_FLOPS_MODEL?.trim().toLowerCase();
@@ -76,6 +92,13 @@ export function flopsConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Partia
 			throw new Error(`PI_CLM_FLOPS_MODEL must be auto, off or one of ${Object.keys(FLOPS_PRESETS).join(", ")}, got ${model}`);
 		}
 		config.model = model as FlopsConfig["model"];
+	}
+	const source = env.PI_CLM_FLOPS_SOURCE?.trim().toLowerCase();
+	if (source) {
+		if (source !== "auto" && source !== "server" && source !== "prefix") {
+			throw new Error(`PI_CLM_FLOPS_SOURCE must be auto, server or prefix, got ${source}`);
+		}
+		config.source = source;
 	}
 	const number = (name: string): number | undefined => {
 		const raw = env[name]?.trim();
@@ -99,7 +122,7 @@ export function flopsConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Partia
  * size appears in a Qwen3.5-or-later model id (`qwen3.6-27b`, `Qwen/Qwen3.8-27B`,
  * `qwen35-9b`). Any other model has no constants: tokens are still counted, FLOPs are not.
  */
-export function resolveFlopsConstants(config: FlopsConfig, modelId: string | undefined): FlopsConstants | undefined {
+export function resolveFlopsConstants(config: Pick<FlopsConfig, "model" | "perToken" | "perAttentionPair">, modelId: string | undefined): FlopsConstants | undefined {
 	if (config.model === "off") return undefined;
 	if (config.perToken !== undefined && config.perAttentionPair !== undefined) {
 		return { perToken: config.perToken, perAttentionPair: config.perAttentionPair, source: "env" };
@@ -113,42 +136,66 @@ export function resolveFlopsConstants(config: FlopsConfig, modelId: string | und
 	return undefined;
 }
 
+export interface FlopsBreakdown {
+	linear: number;
+	attention: number;
+	total: number;
+}
+
 /** F_t for one request; see the module comment. */
 export function requestFlops(
 	constants: Pick<FlopsConstants, "perToken" | "perAttentionPair">,
 	tokens: { prompt: number; reused: number; output: number },
-): { linear: number; attention: number; total: number } {
+): FlopsBreakdown {
 	const P = tokens.prompt;
-	const R = Math.min(tokens.reused, P);
+	const R = Math.max(0, Math.min(tokens.reused, P));
 	const G = tokens.output;
 	const linear = constants.perToken * (P - R + G);
 	const attention = constants.perAttentionPair * ((P * P - R * R) / 2 + G * P + (G * G) / 2);
 	return { linear, attention, total: linear + attention };
 }
 
+/** Running totals of a branch. FLOPs fields are null when no request had model constants. */
 export interface FlopsTotals {
 	requests: number;
 	promptTokens: number;
-	reusedPrefixTokens: number;
-	newPromptTokens: number;
 	outputTokens: number;
-	/** Sum of the provider's reported cache hits (comparison only; not part of the metric). */
-	serverCachedTokens: number;
-	/** Requests whose provider reported a cache-hit count. */
-	serverCachedReported: number;
-	/** Σ F_t over requests that had constants. */
-	flops: number;
-	linearFlops: number;
-	attentionFlops: number;
-	/** Requests counted without constants (unknown model). */
+	/** Prefix match: reused and newly prefilled prompt tokens, and Σ F_t. */
+	prefixReusedTokens: number;
+	prefixNewTokens: number;
+	prefixMatchFlops: number;
+	prefixMatchLinearFlops: number;
+	prefixMatchAttentionFlops: number;
+	/** Server cached tokens and Σ F_t from them; null once a request reported no count. */
+	serverCachedTokens: number | null;
+	serverCachedFlops: number | null;
+	serverCachedLinearFlops: number | null;
+	serverCachedAttentionFlops: number | null;
+	/** Requests whose provider reported a positive cache count (see `auto` in the module comment). */
+	serverPositiveRequests: number;
+	/** Requests counted without constants (unknown model); their FLOPs are not in the sums. */
 	requestsWithoutFlops: number;
+	/** Headline: the source chosen by `PI_CLM_FLOPS_SOURCE` and its Σ F_t (null when unavailable). */
+	source: FlopsSource;
+	flops: number | null;
 }
 
 export function emptyFlopsTotals(): FlopsTotals {
 	return {
-		requests: 0, promptTokens: 0, reusedPrefixTokens: 0, newPromptTokens: 0, outputTokens: 0,
-		serverCachedTokens: 0, serverCachedReported: 0, flops: 0, linearFlops: 0, attentionFlops: 0, requestsWithoutFlops: 0,
+		requests: 0, promptTokens: 0, outputTokens: 0,
+		prefixReusedTokens: 0, prefixNewTokens: 0, prefixMatchFlops: 0, prefixMatchLinearFlops: 0, prefixMatchAttentionFlops: 0,
+		serverCachedTokens: 0, serverCachedFlops: 0, serverCachedLinearFlops: 0, serverCachedAttentionFlops: 0,
+		serverPositiveRequests: 0, requestsWithoutFlops: 0, source: "prefix-match", flops: 0,
 	};
+}
+
+/** The headline source and value for a set of totals. */
+export function headlineFlops(totals: FlopsTotals, mode: FlopsSourceMode): { source: FlopsSource; flops: number | null } {
+	const useServer = mode === "server" ||
+		(mode === "auto" && totals.serverCachedFlops !== null && totals.serverPositiveRequests > 0);
+	const source: FlopsSource = useServer ? "server-cached-tokens" : "prefix-match";
+	if (totals.requests > 0 && totals.requestsWithoutFlops === totals.requests) return { source, flops: null };
+	return { source, flops: useServer ? totals.serverCachedFlops : totals.prefixMatchFlops };
 }
 
 /** One request, as persisted in a `pi-clm-flops` session entry. */
@@ -159,24 +206,23 @@ export interface FlopsRequestRecord {
 	/** Response time (the assistant message's timestamp), ISO. */
 	at?: string;
 	model?: string;
+	promptTokens: number;
+	outputTokens: number;
 	/** Prompt units: tool definitions (when sent) + messages. */
 	units: number;
 	reusedUnits: number;
-	promptTokens: number;
-	reusedPrefixTokens: number;
-	newPromptTokens: number;
-	outputTokens: number;
-	/** The provider's reported cache hits for this request, when reported. */
-	serverCachedTokens?: number;
-	/** F_t; null without constants. */
+	/** Prefix match: reused / new prompt tokens and F_t. */
+	prefixMatch: { reusedTokens: number; newTokens: number; flops: FlopsBreakdown | null };
+	/** Server cached tokens and F_t from them; null when the response carried no count. */
+	serverCached: { cachedTokens: number; newTokens: number; flops: FlopsBreakdown | null } | null;
+	/** Headline F_t of this request, from the run's current headline source. */
+	source: FlopsSource;
 	flops: number | null;
-	linearFlops: number | null;
-	attentionFlops: number | null;
 	constants: FlopsConstants | null;
 	cumulative: FlopsTotals;
 	/** The earlier request whose leading units were reused, for rebuilding after resume. */
 	prefixOf: number | null;
-	/** Unit keys and token weights first seen in this request. */
+	/** Keys and token weights of the trie nodes this request added (its units after the match). */
 	newUnits: [string, number][];
 }
 
@@ -184,6 +230,9 @@ export interface FlopsSummaryRecord {
 	version: 1;
 	metric: "prefix-reuse FLOPs";
 	at: string;
+	/** Headline source and value (also in `totals`). */
+	source: FlopsSource;
+	flops: number | null;
 	totals: FlopsTotals;
 	constants: FlopsConstants | null;
 	/** Assistant responses that reported no prompt usage (failed or aborted requests); not counted. */
@@ -192,6 +241,8 @@ export interface FlopsSummaryRecord {
 
 interface TrieNode {
 	children: Map<string, TrieNode>;
+	/** Token weight of the unit that ends at this node, for this exact path. */
+	weight: number;
 	/** A request whose prompt contains the path to this node as its leading units. */
 	request: number;
 }
@@ -251,17 +302,17 @@ export interface ResponseUsage {
  * the record to persist. Restorable from the records on a branch.
  */
 export class PrefixReuseMeter {
-	private root: TrieNode = { children: new Map(), request: 0 };
-	private weights = new Map<string, number>();
+	private root: TrieNode = { children: new Map(), weight: 0, request: 0 };
 	private unitsByRequest = new Map<number, string[]>();
 	private pending: PendingRequest | undefined;
 	totals: FlopsTotals = emptyFlopsTotals();
 	lastConstants: FlopsConstants | null = null;
 	unmeasuredResponses = 0;
 
+	constructor(private readonly mode: FlopsSourceMode = "auto") {}
+
 	reset(): void {
-		this.root = { children: new Map(), request: 0 };
-		this.weights.clear();
+		this.root = { children: new Map(), weight: 0, request: 0 };
 		this.unitsByRequest.clear();
 		this.pending = undefined;
 		this.totals = emptyFlopsTotals();
@@ -273,15 +324,14 @@ export class PrefixReuseMeter {
 	restore(records: readonly FlopsRequestRecord[]): void {
 		this.reset();
 		for (const record of records) {
-			const base = record.prefixOf ? (this.unitsByRequest.get(record.prefixOf) ?? []).slice(0, record.reusedUnits) : [];
-			if (base.length !== record.reusedUnits) {
-				// A record whose prefix source is missing (e.g. an older branch layout): keep totals, drop reuse history.
-				this.root = { children: new Map(), request: 0 };
-				this.unitsByRequest.clear();
+			let base = record.prefixOf ? (this.unitsByRequest.get(record.prefixOf) ?? []).slice(0, record.reusedUnits) : [];
+			if (base.length !== record.reusedUnits) base = []; // prefix source missing: keep totals, drop that reuse history
+			let node = this.root;
+			for (const key of base) node = node.children.get(key) ?? node;
+			if (base.length === record.reusedUnits) {
+				for (const [key, weight] of record.newUnits) node = this.child(node, key, weight, record.request);
+				this.unitsByRequest.set(record.request, [...base, ...record.newUnits.map(([key]) => key)]);
 			}
-			for (const [key, weight] of record.newUnits) if (!this.weights.has(key)) this.weights.set(key, weight);
-			const keys = [...base, ...record.newUnits.map(([key]) => key)];
-			this.insert(keys, record.request);
 			this.totals = { ...record.cumulative };
 			this.lastConstants = record.constants;
 		}
@@ -305,63 +355,78 @@ export class PrefixReuseMeter {
 			return undefined;
 		}
 		const output = Math.max(0, usage?.output ?? 0);
-		const { matchedUnits, reusedTokens, prefixOf } = this.match(pending.keys);
-		const reused = Math.min(reusedTokens, prompt);
-		const fresh = prompt - reused;
 
-		// New units share the newly prefilled tokens in proportion to their serialized size.
+		// Prefix match: walk the trie; matched nodes carry their weights.
+		let node = this.root;
+		let matchedUnits = 0;
+		let matchedTokens = 0;
+		for (const key of pending.keys) {
+			const next = node.children.get(key);
+			if (!next) break;
+			node = next;
+			matchedUnits += 1;
+			matchedTokens += next.weight;
+		}
+		const prefixOf = node.request;
+		const reused = Math.min(matchedTokens, prompt);
+		const fresh = prompt - reused;
+		// New nodes share the newly prefilled tokens in proportion to their serialized size.
 		const newKeys = pending.keys.slice(matchedUnits);
 		const newSizes = pending.sizes.slice(matchedUnits);
 		const sizeTotal = newSizes.reduce((sum, size) => sum + size, 0);
+		const request = this.totals.requests + 1;
 		const newUnits: [string, number][] = [];
 		let assigned = 0;
 		newKeys.forEach((key, index) => {
 			const weight = index === newKeys.length - 1 ? fresh - assigned : Math.round((fresh * newSizes[index]!) / sizeTotal);
 			assigned += weight;
-			if (!this.weights.has(key)) {
-				this.weights.set(key, weight);
-				newUnits.push([key, weight]);
-			} else {
-				newUnits.push([key, this.weights.get(key)!]);
-			}
+			node = this.child(node, key, weight, request);
+			newUnits.push([key, weight]);
 		});
+		this.unitsByRequest.set(request, [...pending.keys]);
 
-		const request = this.totals.requests + 1;
-		this.insert(pending.keys, request);
 		const constants = details.constants ?? null;
-		const cost = constants ? requestFlops(constants, { prompt, reused, output }) : undefined;
-		const serverCached = usage?.cacheRead;
-		const reported = typeof serverCached === "number";
+		const cached = typeof usage?.cacheRead === "number" && Number.isFinite(usage.cacheRead) ? Math.max(0, Math.min(usage.cacheRead, prompt)) : undefined;
+		const prefixCost = constants ? requestFlops(constants, { prompt, reused, output }) : null;
+		const serverCost = constants && cached !== undefined ? requestFlops(constants, { prompt, reused: cached, output }) : null;
+		const before = this.totals;
+		const serverValid = before.serverCachedFlops !== null && cached !== undefined;
+		const add = (total: number | null, part: number | undefined) => (total === null || !serverValid ? null : total + (part ?? 0));
 		const totals: FlopsTotals = {
 			requests: request,
-			promptTokens: this.totals.promptTokens + prompt,
-			reusedPrefixTokens: this.totals.reusedPrefixTokens + reused,
-			newPromptTokens: this.totals.newPromptTokens + fresh,
-			outputTokens: this.totals.outputTokens + output,
-			serverCachedTokens: this.totals.serverCachedTokens + (reported ? serverCached : 0),
-			serverCachedReported: this.totals.serverCachedReported + (reported ? 1 : 0),
-			flops: this.totals.flops + (cost?.total ?? 0),
-			linearFlops: this.totals.linearFlops + (cost?.linear ?? 0),
-			attentionFlops: this.totals.attentionFlops + (cost?.attention ?? 0),
-			requestsWithoutFlops: this.totals.requestsWithoutFlops + (cost ? 0 : 1),
+			promptTokens: before.promptTokens + prompt,
+			outputTokens: before.outputTokens + output,
+			prefixReusedTokens: before.prefixReusedTokens + reused,
+			prefixNewTokens: before.prefixNewTokens + fresh,
+			prefixMatchFlops: before.prefixMatchFlops + (prefixCost?.total ?? 0),
+			prefixMatchLinearFlops: before.prefixMatchLinearFlops + (prefixCost?.linear ?? 0),
+			prefixMatchAttentionFlops: before.prefixMatchAttentionFlops + (prefixCost?.attention ?? 0),
+			serverCachedTokens: add(before.serverCachedTokens, cached),
+			serverCachedFlops: add(before.serverCachedFlops, serverCost?.total),
+			serverCachedLinearFlops: add(before.serverCachedLinearFlops, serverCost?.linear),
+			serverCachedAttentionFlops: add(before.serverCachedAttentionFlops, serverCost?.attention),
+			serverPositiveRequests: before.serverPositiveRequests + (cached !== undefined && cached > 0 ? 1 : 0),
+			requestsWithoutFlops: before.requestsWithoutFlops + (constants ? 0 : 1),
+			source: "prefix-match",
+			flops: null,
 		};
+		Object.assign(totals, headlineFlops(totals, this.mode));
 		this.totals = totals;
 		if (constants) this.lastConstants = constants;
+		const requestHeadline = totals.source === "server-cached-tokens" ? serverCost?.total : prefixCost?.total;
 		return {
 			version: 1,
 			request,
 			...(details.at ? { at: details.at } : {}),
 			...(details.model ? { model: details.model } : {}),
+			promptTokens: prompt,
+			outputTokens: output,
 			units: pending.keys.length,
 			reusedUnits: matchedUnits,
-			promptTokens: prompt,
-			reusedPrefixTokens: reused,
-			newPromptTokens: fresh,
-			outputTokens: output,
-			...(reported ? { serverCachedTokens: serverCached } : {}),
-			flops: cost?.total ?? null,
-			linearFlops: cost?.linear ?? null,
-			attentionFlops: cost?.attention ?? null,
+			prefixMatch: { reusedTokens: reused, newTokens: fresh, flops: prefixCost },
+			serverCached: cached === undefined ? null : { cachedTokens: cached, newTokens: prompt - cached, flops: serverCost },
+			source: totals.source,
+			flops: requestHeadline ?? null,
 			constants,
 			cumulative: { ...totals },
 			prefixOf: matchedUnits > 0 ? prefixOf : null,
@@ -374,37 +439,21 @@ export class PrefixReuseMeter {
 			version: 1,
 			metric: "prefix-reuse FLOPs",
 			at,
+			source: this.totals.source,
+			flops: this.totals.flops,
 			totals: { ...this.totals },
 			constants: this.lastConstants,
 			unmeasuredResponses: this.unmeasuredResponses,
 		};
 	}
 
-	private match(keys: readonly string[]): { matchedUnits: number; reusedTokens: number; prefixOf: number } {
-		let node = this.root;
-		let matchedUnits = 0;
-		let reusedTokens = 0;
-		for (const key of keys) {
-			const next = node.children.get(key);
-			if (!next) break;
-			node = next;
-			matchedUnits += 1;
-			reusedTokens += this.weights.get(key) ?? 0;
+	private child(node: TrieNode, key: string, weight: number, request: number): TrieNode {
+		let next = node.children.get(key);
+		if (!next) {
+			next = { children: new Map(), weight, request };
+			node.children.set(key, next);
 		}
-		return { matchedUnits, reusedTokens, prefixOf: node.request };
-	}
-
-	private insert(keys: readonly string[], request: number): void {
-		this.unitsByRequest.set(request, [...keys]);
-		let node = this.root;
-		for (const key of keys) {
-			let next = node.children.get(key);
-			if (!next) {
-				next = { children: new Map(), request };
-				node.children.set(key, next);
-			}
-			node = next;
-		}
+		return next;
 	}
 }
 
@@ -412,7 +461,8 @@ export function isFlopsRequestRecord(value: unknown): value is FlopsRequestRecor
 	if (!value || typeof value !== "object") return false;
 	const record = value as Partial<FlopsRequestRecord>;
 	return record.version === 1 && typeof record.request === "number" && typeof record.promptTokens === "number" &&
-		Array.isArray(record.newUnits) && Boolean(record.cumulative) && typeof record.cumulative === "object";
+		Array.isArray(record.newUnits) && Boolean(record.cumulative) && typeof record.cumulative === "object" &&
+		Boolean(record.prefixMatch) && typeof record.prefixMatch === "object";
 }
 
 /** `1.19 PFLOP`, `845 TFLOP`. */

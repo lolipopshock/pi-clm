@@ -2232,7 +2232,7 @@ export class LiveContextViewer implements Component {
 			latest ? `now ${formatCount(latest.tokens)}` : undefined,
 			latest ? `peak ${formatCount(timeline.peakTokens)}` : undefined,
 			this.model.budget !== undefined ? `budget ${formatCount(this.model.budget)}` : undefined,
-			timeline.flops && timeline.flops.requests > timeline.flops.requestsWithoutFlops
+			timeline.flops && timeline.flops.flops !== null
 				? `${formatFlops(timeline.flops.flops)} prefix-reuse`
 				: undefined,
 		].filter(Boolean).join(" · ");

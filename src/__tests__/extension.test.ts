@@ -1852,18 +1852,22 @@ describe("pi-clm entry point", () => {
 			const records = harness.branch.filter((entry) => entry.customType === "pi-clm-flops").map((entry) => entry.data);
 			assert.equal(records.length, 2);
 			assert.deepEqual(
-				records.map((r: any) => [r.request, r.promptTokens, r.reusedPrefixTokens, r.newPromptTokens, r.outputTokens, r.serverCachedTokens]),
+				records.map((r: any) => [r.request, r.promptTokens, r.prefixMatch.reusedTokens, r.prefixMatch.newTokens, r.outputTokens, r.serverCached.cachedTokens]),
 				[[1, 1000, 0, 1000, 100, 0], [2, 1300, 1000, 300, 50, 1000]],
 			);
 			assert.equal(records[1].at, new Date(2_000).toISOString());
-			assert.equal(records[1].cumulative.flops, records[0].flops + records[1].flops);
+			// The server reported its cache hits on every request: the headline uses them.
+			assert.equal(records[1].cumulative.source, "server-cached-tokens");
+			assert.equal(records[1].cumulative.flops, records[0].serverCached.flops.total + records[1].serverCached.flops.total);
+			assert.equal(records[1].cumulative.prefixMatchFlops, records[0].prefixMatch.flops.total + records[1].prefixMatch.flops.total);
 			const summary = harness.branch.filter((entry) => entry.customType === "pi-clm-flops-summary").map((entry) => entry.data);
 			assert.equal(summary.length, 1);
-			assert.equal(summary[0].totals.flops, records[1].cumulative.flops);
+			assert.equal(summary[0].source, "server-cached-tokens");
+			assert.equal(summary[0].flops, records[1].cumulative.flops);
 			assert.equal(summary[0].constants.source, "27b");
 
 			await harness.commands.get("clm").handler("status", harness.ctx);
-			assert.match(harness.notifications.at(-1)!, /prefix-reuse [0-9.]+ [PT]FLOP over 2 requests · reused 1k of 2\.3k prompt tok/);
+			assert.match(harness.notifications.at(-1)!, /prefix-reuse [0-9.]+ [PT]FLOP \(server cached tokens\) over 2 requests · prefix match [0-9.]+ [PT]FLOP · prompt 2\.3k tok: 1k reused by prefix match, 1k cached by the server/);
 
 			// Resume: totals and reuse history come back from the session entries.
 			const resumed = createHarness([...harness.branch]);
@@ -1881,7 +1885,7 @@ describe("pi-clm entry point", () => {
 					message: { role: "assistant", content: [], usage: { input: 1400, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { total: 0 } }, stopReason: "stop", timestamp: 3_000 },
 				});
 				const third = resumed.branch.filter((entry) => entry.customType === "pi-clm-flops").at(-1)!.data;
-				assert.deepEqual([third.request, third.reusedPrefixTokens, third.cumulative.requests], [3, 1300, 3]);
+				assert.deepEqual([third.request, third.prefixMatch.reusedTokens, third.cumulative.requests], [3, 1300, 3]);
 			} finally { await emit(resumed, "session_shutdown", {}); }
 		} finally { await emit(harness, "session_shutdown", {}); }
 	});

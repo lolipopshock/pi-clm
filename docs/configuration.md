@@ -49,6 +49,7 @@ saying which variable is wrong.
 | `PI_CLM_FLOPS_MODEL`        | `auto` (default), `27b`, `9b`, or `off` (no accounting)                          | —               |
 | `PI_CLM_FLOPS_PER_TOKEN`    | FLOPs per processed token, e.g. `48.7064e9`; with `PI_CLM_FLOPS_PER_PAIR`, overrides the preset | — |
 | `PI_CLM_FLOPS_PER_PAIR`     | FLOPs per attention query–key pair, e.g. `393216`; set together with the above    | —               |
+| `PI_CLM_FLOPS_SOURCE`       | `auto` (default: server cached tokens when reported, else prefix match), `server` or `prefix` | — |
 
 ## Notes
 
@@ -74,23 +75,33 @@ Every request's compute is recorded as prefix-reuse FLOPs, the cost measure of
 [Context Language Models](https://arxiv.org/abs/2609.37725) (appendix "Prefix-Reuse FLOPs
 Computation"; reference implementation in the
 [research codebase](https://github.com/facebookresearch/context-language-models/blob/main/clm/clm_harness/flops_metrics/kv_cache_flops.py)).
-At request *t* the prompt has *P* tokens and the model generates *G*. The reused prefix *R*
-is the longest run of leading prompt units — the tool definitions, then each message —
-that also led an earlier request of the session; *U = P − R* tokens are prefilled. The
-request costs
+At request *t* the prompt has *P* tokens and the model generates *G* (the provider's counts);
+*R* prompt tokens come from a reused prefix and *U = P − R* are prefilled. The request costs
 
 ```text
 F = C_token · (U + G) + C_attn · ((P² − R²)/2 + G·P + G²/2)
 ```
 
-and the run costs the sum. *P* and *G* are the provider's counts. A message's token weight
-is fixed when it first appears (the new messages of a request share its *U* in proportion
-to their serialized length), so an append-only turn reuses exactly the previous prompt.
+and the run costs the sum. *R* is taken from two sources, and both are recorded for every
+request:
 
-The count is **idealised**: it does not depend on what a particular server kept in its
-cache. When the provider reports cache hits (`prompt_tokens_details.cached_tokens` on
-OpenAI-compatible servers, e.g. vLLM with `--enable-prompt-tokens-details`), they are
-recorded beside it as `serverCachedTokens` and never used in the metric.
+- **server cached tokens** — the provider's count of prompt tokens served from its prefix
+  cache (`prompt_tokens_details.cached_tokens` on OpenAI-compatible servers, e.g. vLLM with
+  `--enable-prompt-tokens-details`; Pi's `cacheRead`).
+- **prefix match** — the longest run of leading prompt units (the tool definitions and system
+  fields, then each message) that also led an earlier request of the session. This mirrors
+  the research code's fallback (prefix matching over the reconstructed context) at message
+  granularity, with token weights from the provider's counts: a message's weight is fixed
+  where it first appears on a prompt path (the new messages of a request share its *U* in
+  proportion to their serialized length), so an append-only turn reuses exactly the previous
+  prompt. It does not depend on what the server kept in its cache, and it is always available.
+
+The headline follows the research code's priority: server cached tokens when every request so
+far reported them, otherwise the prefix match. Pi's OpenAI-compatible providers report a
+missing cache count as 0, so `auto` uses the server count only once some request reported a
+positive value. The server's count can be higher than the prefix match (cache hits shared with
+other sessions on the same server, e.g. the system prompt and tool definitions) or lower
+(block granularity, eviction).
 
 **Constants.** `C_token` is two FLOPs per non-embedding parameter; `C_attn` is
 4 × full-attention layers × query heads × head dimension. With `PI_CLM_FLOPS_MODEL=auto`
@@ -105,11 +116,14 @@ until a preset or explicit constants are set.
 
 **Where it is recorded.**
 
-- `pi-clm-flops` session entry per request: `promptTokens`, `reusedPrefixTokens`,
-  `newPromptTokens`, `outputTokens`, `serverCachedTokens` (when reported), `flops` (with its
-  `linearFlops` and `attentionFlops` parts), `constants`, and `cumulative` totals for the
-  branch so far. With `--mode json` each entry is also printed as an `entry_appended` event.
-- `pi-clm-flops-summary` session entry at the end of every agent run: the branch totals.
+- `pi-clm-flops` session entry per request: `promptTokens`, `outputTokens`, `prefixMatch`
+  (`reusedTokens`, `newTokens`, `flops`), `serverCached` (`cachedTokens`, `newTokens`,
+  `flops`; null without a count), the headline `source` and `flops`, `constants`, and
+  `cumulative` totals for the branch so far (both sources; the server totals become null
+  once a request had no count). With `--mode json` each entry is also printed as an
+  `entry_appended` event.
+- `pi-clm-flops-summary` session entry at the end of every agent run: headline `source` and
+  `flops`, and the branch totals.
 - `/clm status` (one extra line once a request is counted) and the **overview** page.
 
 Responses without a prompt count (failed or aborted requests) are not counted. Totals and

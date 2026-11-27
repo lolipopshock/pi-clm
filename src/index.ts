@@ -277,7 +277,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 	const pressure = new PressureTracker();
 	const continuitySize = new ContinuitySizeTracker();
 	const flopsConfig: FlopsConfig = { ...DEFAULT_FLOPS_CONFIG, ...(options.flops ?? {}) };
-	const flopsMeter = flopsConfig.model === "off" ? undefined : new PrefixReuseMeter();
+	const flopsMeter = flopsConfig.model === "off" ? undefined : new PrefixReuseMeter(flopsConfig.source);
 	let budgetPolicy = resolveBudgetPolicy(options.budget);
 	let observationCap = resolveObservationCap(options.observationCap);
 	let overflowGuard = resolveOverflowGuard(options.overflow);
@@ -531,14 +531,28 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		return [head, `${messages}${outcome}`, `${settingsSummary(ctx)} · /clm for the panel`, ...(compute ? [compute] : []), ...warnings()].join("\n");
 	}
 
-	/** `prefix-reuse 1.19 PFLOP over 6 requests · reused 49.5k of 69.1k prompt tok`, once a request is counted. */
+	/**
+	 * `prefix-reuse 1.19 PFLOP (server cached tokens) over 6 requests · prefix match 1.21 PFLOP · prompt 69k tok:
+	 * 49k reused by prefix match, 48k cached by the server`, once a request is counted.
+	 */
 	function flopsStatusLine(): string | undefined {
 		const totals = flopsMeter?.totals;
 		if (!totals || totals.requests === 0) return undefined;
-		const flops = totals.requestsWithoutFlops === totals.requests
-			? "prefix-reuse FLOPs: no model constants (PI_CLM_FLOPS_MODEL)"
-			: `prefix-reuse ${formatFlops(totals.flops)}`;
-		return `${flops} over ${totals.requests} request${totals.requests === 1 ? "" : "s"} · reused ${formatTokens(totals.reusedPrefixTokens)} of ${formatTokens(totals.promptTokens)} prompt tok`;
+		const noConstants = totals.requestsWithoutFlops === totals.requests;
+		const requests = `${totals.requests} request${totals.requests === 1 ? "" : "s"}`;
+		const head = noConstants
+			? `prefix-reuse FLOPs: no model constants (PI_CLM_FLOPS_MODEL) · ${requests}`
+			: totals.flops === null
+				? `prefix-reuse FLOPs (${totals.source.replaceAll("-", " ")}): unavailable · ${requests}`
+				: `prefix-reuse ${formatFlops(totals.flops)} (${totals.source.replaceAll("-", " ")}) over ${requests}`;
+		const other = noConstants
+			? undefined
+			: totals.source === "server-cached-tokens"
+				? `prefix match ${formatFlops(totals.prefixMatchFlops)}`
+				: totals.serverCachedFlops !== null && totals.serverPositiveRequests > 0 ? `server cached tokens ${formatFlops(totals.serverCachedFlops)}` : undefined;
+		const server = totals.serverCachedTokens !== null && totals.serverPositiveRequests > 0 ? `, ${formatTokens(totals.serverCachedTokens)} cached by the server` : "";
+		return [head, other, `prompt ${formatTokens(totals.promptTokens)} tok: ${formatTokens(totals.prefixReusedTokens)} reused by prefix match${server}`]
+			.filter(Boolean).join(" · ");
 	}
 
 	/** Grouped details: the text form of the panel's settings page. */

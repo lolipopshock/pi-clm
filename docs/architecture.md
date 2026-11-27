@@ -332,14 +332,17 @@ appended when the template has no `{{instructions}}`); the file is read on every
 `src/flops.ts`. A `before_provider_request` handler reads the payload as sent (it never
 returns a change) and splits it into prompt units: the tool definitions and system fields
 outside the messages, then one unit per message, each keyed by a hash of its JSON. The
-`message_end` of the assistant reply supplies the provider's prompt and output counts. A
-trie of the unit sequences of earlier requests gives the longest reused prefix; each unit's
-token weight is fixed when it first appears, by splitting the request's newly prefilled
-tokens across its new units by serialized length. The request's FLOPs follow the paper's
-per-turn formula (configuration.md). Each request appends a `pi-clm-flops` entry (with the
-units it added and which earlier request it extended, so `restore` can rebuild the trie on
-resume and `/tree`); `agent_end` appends a `pi-clm-flops-summary`. The timeline attaches
-each record to its request by response time, falling back to prompt size.
+`message_end` of the assistant reply supplies the provider's prompt, output and cache-hit
+counts. A trie of the unit paths of earlier requests gives the longest reused prefix; each
+trie node holds the token weight of its unit on that path, set when the node is created by
+splitting the request's newly prefilled tokens across its new units by serialized length, so
+the weights along a request's path sum to its prompt size. The request's FLOPs follow the
+paper's per-turn formula once with the prefix match and once with the server's cache hits;
+the headline source follows `PI_CLM_FLOPS_SOURCE` (configuration.md). Each request appends a
+`pi-clm-flops` entry (with the trie nodes it added and which earlier request it extended, so
+`restore` can rebuild the trie on resume and `/tree`); `agent_end` appends a
+`pi-clm-flops-summary`. The timeline attaches each record to its request by response time,
+falling back to prompt size.
 
 ## 8. Panel
 

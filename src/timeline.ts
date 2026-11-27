@@ -143,7 +143,7 @@ function attachFlops(points: TimelinePoint[], records: readonly FlopsRequestReco
 		if (index < 0) continue;
 		const point = points[index]!;
 		if (record.flops !== null) point.flops = record.flops;
-		point.reusedTokens = record.reusedPrefixTokens;
+		point.reusedTokens = record.prefixMatch.reusedTokens;
 		cursor = index + 1;
 	}
 }
@@ -542,9 +542,10 @@ export function formatTimelineReport(timeline: ContextTimeline, width = 72, budg
 	if (flops && flops.requests > 0) {
 		lines.push(
 			"",
-			`Prefix-reuse compute: ${flops.requestsWithoutFlops === flops.requests ? "no model constants" : formatFlops(flops.flops)} over ${flops.requests} request${flops.requests === 1 ? "" : "s"}; ` +
-				`${formatTokenCount(flops.reusedPrefixTokens)} of ${formatTokenCount(flops.promptTokens)} prompt tokens reused, ` +
-				`${formatTokenCount(flops.newPromptTokens)} prefilled, ${formatTokenCount(flops.outputTokens)} generated.`,
+			`Prefix-reuse compute: ${flops.flops === null ? "unavailable" : formatFlops(flops.flops)} (${flops.source.replaceAll("-", " ")}) over ${flops.requests} request${flops.requests === 1 ? "" : "s"}; ` +
+				`prefix match reused ${formatTokenCount(flops.prefixReusedTokens)} of ${formatTokenCount(flops.promptTokens)} prompt tokens` +
+				`${flops.serverCachedTokens !== null && flops.serverPositiveRequests > 0 ? `, the server cached ${formatTokenCount(flops.serverCachedTokens)}` : ""}; ` +
+				`${formatTokenCount(flops.outputTokens)} generated.`,
 		);
 	}
 	return lines.join("\n");
