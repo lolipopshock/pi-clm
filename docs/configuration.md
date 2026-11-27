@@ -124,8 +124,18 @@ until a preset or explicit constants are set.
   once a request had no count). With `--mode json` each entry is also printed as an
   `entry_appended` event.
 - `pi-clm-flops-summary` session entry at the end of every agent run: headline `source` and
-  `flops`, and the branch totals.
+  `flops`, the branch totals, and `nativeCompactions` (see below).
 - `/clm status` (one extra line once a request is counted) and the **overview** page.
+
+**Pi's native compaction.** When Pi compacts the conversation itself (its threshold or
+overflow compaction, or `/compact`), it summarizes the history with a separate model call that
+does not pass through the request hooks, so that call is not in the per-request records or the
+totals. The run summary reports it apart from the totals: `nativeCompactions.count` (compaction
+entries on the branch), their provider usage (`promptTokens`, `outputTokens`) and
+`estimatedFlops`, an estimate that counts each summarization prompt as a fresh prefill without
+reuse (Pi reports the two calls of a split turn as one usage, so the attention term is an upper
+bound for those) and is never added to `flops`. `/clm status` notes how many compactions are
+not included.
 
 Responses without a prompt count (failed or aborted requests) are not counted. Totals and
 reuse history are rebuilt from the entries on resume and `/tree`. The mirror never contains

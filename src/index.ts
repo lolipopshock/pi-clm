@@ -53,6 +53,7 @@ import {
 	DEFAULT_FLOPS_CONFIG,
 	formatFlops,
 	isFlopsRequestRecord,
+	nativeCompactionStats,
 	PREFIX_REUSE_FLOPS_ENTRY,
 	PREFIX_REUSE_FLOPS_SUMMARY_ENTRY,
 	PrefixReuseMeter,
@@ -527,7 +528,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 			? ` · last ${state.lastOutcome.kind === "applied" ? "edit" : state.lastOutcome.kind} ${new Date(state.lastOutcome.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
 			: " · no edits yet";
 		const messages = raw !== undefined && sent !== undefined ? `messages ~${formatTokens(sent)} sent of ~${formatTokens(raw)} raw${saved}` : "no messages yet";
-		const compute = flopsStatusLine();
+		const compute = flopsStatusLine(ctx);
 		return [head, `${messages}${outcome}`, `${settingsSummary(ctx)} · /clm for the panel`, ...(compute ? [compute] : []), ...warnings()].join("\n");
 	}
 
@@ -535,7 +536,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 	 * `prefix-reuse 1.19 PFLOP (server cached tokens) over 6 requests · prefix match 1.21 PFLOP · prompt 69k tok:
 	 * 49k reused by prefix match, 48k cached by the server`, once a request is counted.
 	 */
-	function flopsStatusLine(): string | undefined {
+	function flopsStatusLine(ctx: ExtensionContext): string | undefined {
 		const totals = flopsMeter?.totals;
 		if (!totals || totals.requests === 0) return undefined;
 		const noConstants = totals.requestsWithoutFlops === totals.requests;
@@ -551,7 +552,9 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 				? `prefix match ${formatFlops(totals.prefixMatchFlops)}`
 				: totals.serverCachedFlops !== null && totals.serverPositiveRequests > 0 ? `server cached tokens ${formatFlops(totals.serverCachedFlops)}` : undefined;
 		const server = totals.serverCachedTokens !== null && totals.serverPositiveRequests > 0 ? `, ${formatTokens(totals.serverCachedTokens)} cached by the server` : "";
-		return [head, other, `prompt ${formatTokens(totals.promptTokens)} tok: ${formatTokens(totals.prefixReusedTokens)} reused by prefix match${server}`]
+		const compactions = nativeCompactionStats(ctx.sessionManager.getBranch() as { type?: string; usage?: ResponseUsage }[], null).count;
+		const compactionNote = compactions > 0 ? `${compactions} native compaction${compactions === 1 ? "" : "s"} not included` : undefined;
+		return [head, other, `prompt ${formatTokens(totals.promptTokens)} tok: ${formatTokens(totals.prefixReusedTokens)} reused by prefix match${server}`, compactionNote]
 			.filter(Boolean).join(" · ");
 	}
 
@@ -1700,8 +1703,13 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 			return undefined;
 		});
 
-		pi.on("agent_end", () => {
-			if (flopsMeter.totals.requests > 0) pi.appendEntry(PREFIX_REUSE_FLOPS_SUMMARY_ENTRY, flopsMeter.summary());
+		pi.on("agent_end", (_event, ctx) => {
+			if (flopsMeter.totals.requests === 0) return;
+			const compactions = nativeCompactionStats(
+				ctx.sessionManager.getBranch() as { type?: string; usage?: ResponseUsage }[],
+				flopsMeter.lastConstants,
+			);
+			pi.appendEntry(PREFIX_REUSE_FLOPS_SUMMARY_ENTRY, flopsMeter.summary(undefined, compactions));
 		});
 	}
 

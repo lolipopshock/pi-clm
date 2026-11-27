@@ -5,6 +5,7 @@ import {
 	FLOPS_PRESETS,
 	flopsConfigFromEnv,
 	formatFlops,
+	nativeCompactionStats,
 	PrefixReuseMeter,
 	promptUnits,
 	requestFlops,
@@ -219,6 +220,31 @@ test("environment parsing rejects malformed values", () => {
 	assert.throws(() => flopsConfigFromEnv({ PI_CLM_FLOPS_SOURCE: "exact" }), /PI_CLM_FLOPS_SOURCE/);
 	assert.throws(() => flopsConfigFromEnv({ PI_CLM_FLOPS_PER_TOKEN: "1e9" }), /set together/);
 	assert.throws(() => flopsConfigFromEnv({ PI_CLM_FLOPS_PER_TOKEN: "-1", PI_CLM_FLOPS_PER_PAIR: "1" }), /positive/);
+});
+
+test("native compactions are counted and estimated separately, never added to the headline", () => {
+	const meter = new PrefixReuseMeter();
+	run(meter, [user], { input: 1000, cacheRead: 0, output: 5 });
+	const entries = [
+		{ type: "message" },
+		{ type: "compaction", usage: { input: 28_000, cacheRead: 320, cacheWrite: 0, output: 2_443 } },
+		{ type: "custom" },
+		{ type: "compaction", usage: { input: 20_144, output: 7_407 } },
+	];
+	const stats = nativeCompactionStats(entries, Q27);
+	assert.deepEqual([stats.count, stats.withUsage, stats.promptTokens, stats.outputTokens], [2, 2, 48_464, 9_850]);
+	assert.equal(
+		stats.estimatedFlops,
+		requestFlops(Q27, { prompt: 28_320, reused: 0, output: 2_443 }).total + requestFlops(Q27, { prompt: 20_144, reused: 0, output: 7_407 }).total,
+	);
+	const summary = meter.summary("t", stats);
+	assert.deepEqual(summary.nativeCompactions, stats);
+	assert.equal(summary.flops, meter.totals.flops); // headline unchanged
+	// No estimate without constants, or when a compaction carries no usage (counted, not estimated).
+	assert.equal(nativeCompactionStats(entries, null).estimatedFlops, null);
+	const partial = nativeCompactionStats([...entries, { type: "compaction" }], Q27);
+	assert.deepEqual([partial.count, partial.withUsage, partial.estimatedFlops], [3, 2, null]);
+	assert.deepEqual(meter.summary("t").nativeCompactions, { count: 0, withUsage: 0, promptTokens: 0, outputTokens: 0, estimatedFlops: null });
 });
 
 test("formatting", () => {

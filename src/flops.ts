@@ -34,6 +34,11 @@
  * R_t is clamped to P_t), and an append-only turn reuses exactly the previous prompt. Only the
  * split of one request's new tokens between its new messages is approximate.
  *
+ * Pi's native compaction summarizes history with its own model call, which does not pass
+ * through the request hooks: it is not in the per-request records or the totals. The run
+ * summary counts the compactions on the branch and, when their usage is known, gives a
+ * separately labelled estimate of their FLOPs (never added to the headline).
+ *
  * Accounting only: nothing here changes a request.
  */
 
@@ -226,6 +231,22 @@ export interface FlopsRequestRecord {
 	newUnits: [string, number][];
 }
 
+export interface NativeCompactionStats {
+	/** Pi compaction entries on the branch (their summarization calls are not in the totals). */
+	count: number;
+	/** Those whose entry carries the summarization call's provider usage. */
+	withUsage: number;
+	promptTokens: number;
+	outputTokens: number;
+	/**
+	 * Estimate, not part of `flops`: each summarization prompt counted as a fresh prefill
+	 * (no reuse) plus its output, with the run's constants. Pi reports a split turn's two calls
+	 * as one usage, which makes the attention term an upper bound for those. Null without
+	 * constants or when some compaction has no usage.
+	 */
+	estimatedFlops: number | null;
+}
+
 export interface FlopsSummaryRecord {
 	version: 1;
 	metric: "prefix-reuse FLOPs";
@@ -237,6 +258,29 @@ export interface FlopsSummaryRecord {
 	constants: FlopsConstants | null;
 	/** Assistant responses that reported no prompt usage (failed or aborted requests); not counted. */
 	unmeasuredResponses: number;
+	/** Pi's native compactions on the branch: counted and estimated separately, not in `flops`. */
+	nativeCompactions: NativeCompactionStats;
+}
+
+/** Pi `compaction` entries of a branch, with the estimate described in `NativeCompactionStats`. */
+export function nativeCompactionStats(
+	entries: readonly { type?: string; usage?: ResponseUsage }[],
+	constants: Pick<FlopsConstants, "perToken" | "perAttentionPair"> | null,
+): NativeCompactionStats {
+	const stats: NativeCompactionStats = { count: 0, withUsage: 0, promptTokens: 0, outputTokens: 0, estimatedFlops: 0 };
+	for (const entry of entries) {
+		if (entry.type !== "compaction") continue;
+		stats.count += 1;
+		const prompt = promptTokens(entry.usage);
+		if (prompt <= 0) continue;
+		const output = Math.max(0, entry.usage?.output ?? 0);
+		stats.withUsage += 1;
+		stats.promptTokens += prompt;
+		stats.outputTokens += output;
+		if (constants) stats.estimatedFlops! += requestFlops(constants, { prompt, reused: 0, output }).total;
+	}
+	if (!constants || stats.withUsage < stats.count) stats.estimatedFlops = null;
+	return stats;
 }
 
 interface TrieNode {
@@ -434,7 +478,7 @@ export class PrefixReuseMeter {
 		};
 	}
 
-	summary(at = new Date().toISOString()): FlopsSummaryRecord {
+	summary(at = new Date().toISOString(), nativeCompactions: NativeCompactionStats = nativeCompactionStats([], null)): FlopsSummaryRecord {
 		return {
 			version: 1,
 			metric: "prefix-reuse FLOPs",
@@ -444,6 +488,7 @@ export class PrefixReuseMeter {
 			totals: { ...this.totals },
 			constants: this.lastConstants,
 			unmeasuredResponses: this.unmeasuredResponses,
+			nativeCompactions,
 		};
 	}
 

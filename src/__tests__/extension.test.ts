@@ -1847,6 +1847,11 @@ describe("pi-clm entry point", () => {
 			await request([user], { input: 1000, cacheRead: 0, cacheWrite: 0, output: 100 }, 1_000);
 			await request([user, call, toolResult], { input: 300, cacheRead: 1000, cacheWrite: 0, output: 50 }, 2_000);
 			await emit(harness, "message_end", { type: "message_end", message: { role: "toolResult", content: [] } });
+			// A native Pi compaction on the branch: its summarization call never reaches the request hooks.
+			harness.branch.push({
+				type: "compaction", id: "compaction-1", parentId: harness.branch.at(-1)?.id ?? null, timestamp: new Date().toISOString(),
+				summary: "s", firstKeptEntryId: "x", tokensBefore: 50_000, usage: { input: 20_000, output: 1_000, cacheRead: 0, cacheWrite: 0, totalTokens: 21_000 },
+			});
 			await emit(harness, "agent_end", { type: "agent_end", messages: [] });
 
 			const records = harness.branch.filter((entry) => entry.customType === "pi-clm-flops").map((entry) => entry.data);
@@ -1865,9 +1870,12 @@ describe("pi-clm entry point", () => {
 			assert.equal(summary[0].source, "server-cached-tokens");
 			assert.equal(summary[0].flops, records[1].cumulative.flops);
 			assert.equal(summary[0].constants.source, "27b");
+			assert.deepEqual([summary[0].nativeCompactions.count, summary[0].nativeCompactions.promptTokens, summary[0].nativeCompactions.outputTokens], [1, 20_000, 1_000]);
+			assert.ok(summary[0].nativeCompactions.estimatedFlops > 0);
+			assert.equal(summary[0].flops, records[1].cumulative.flops, "the compaction estimate stays out of the headline");
 
 			await harness.commands.get("clm").handler("status", harness.ctx);
-			assert.match(harness.notifications.at(-1)!, /prefix-reuse [0-9.]+ [PT]FLOP \(server cached tokens\) over 2 requests · prefix match [0-9.]+ [PT]FLOP · prompt 2\.3k tok: 1k reused by prefix match, 1k cached by the server/);
+			assert.match(harness.notifications.at(-1)!, /prefix-reuse [0-9.]+ [PT]FLOP \(server cached tokens\) over 2 requests · prefix match [0-9.]+ [PT]FLOP · prompt 2\.3k tok: 1k reused by prefix match, 1k cached by the server · 1 native compaction not included$/);
 
 			// Resume: totals and reuse history come back from the session entries.
 			const resumed = createHarness([...harness.branch]);
