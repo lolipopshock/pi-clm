@@ -99,9 +99,10 @@ request:
 The headline follows the research code's priority: server cached tokens when every request so
 far reported them, otherwise the prefix match. Pi's OpenAI-compatible providers report a
 missing cache count as 0, so `auto` uses the server count only once some request reported a
-positive value. The server's count can be higher than the prefix match (cache hits shared with
-other sessions on the same server, e.g. the system prompt and tool definitions) or lower
-(block granularity, eviction).
+positive value. The server's count can be higher than the prefix match (on vLLM the previous reply's
+decoded tokens stay cached, which the prefix match counts as prefilled; other sessions on the
+same server can share a prefix) or lower (cache block granularity, coarse for hybrid-attention
+models; eviction).
 
 **Constants.** `C_token` is two FLOPs per non-embedding parameter; `C_attn` is
 4 × full-attention layers × query heads × head dimension. With `PI_CLM_FLOPS_MODEL=auto`
