@@ -327,12 +327,32 @@ from the reconstructed context. The `compact prompt` setting (`PI_CLM_COMPACT_PR
 `{{mirror}}`, `{{current}}`, `{{budget}}` and `{{instructions}}` (typed instructions are
 appended when the template has no `{{instructions}}`); the file is read on every use.
 
+## 7e. Prefix-reuse FLOPs
+
+`src/flops.ts`. A `before_provider_request` handler reads the payload as sent (it never
+returns a change) and splits it into prompt units: the tool definitions and system fields
+outside the messages, then one unit per message, each keyed by a hash of its JSON. The
+`message_end` of the assistant reply supplies the provider's prompt, output and cache-hit
+counts. A trie of the unit paths of earlier requests gives the longest reused prefix; each
+trie node holds the token weight of its unit on that path, set when the node is created by
+splitting the request's newly prefilled tokens across its new units by serialized length, so
+the weights along a request's path sum to its prompt size. The request's FLOPs follow the
+paper's per-turn formula once with the prefix match and once with the server's cache hits;
+the headline source follows `PI_CLM_FLOPS_SOURCE` (configuration.md). Each request appends a
+`pi-clm-flops` entry (with the trie nodes it added and which earlier request it extended, so
+`restore` can rebuild the trie on resume and `/tree`); `agent_end` appends a
+`pi-clm-flops-summary`. The timeline attaches each record to its request by response time,
+falling back to prompt size. Pi's native compaction makes its summarization call outside the
+request hooks; `session_compact` carries its usage, which is added to the totals as a
+`kind: "compaction"` record (reused prefix 0 for the prefix match, the reported cache hits for
+the server source) and kept apart in `totals.compaction`.
+
 ## 8. Panel
 
 `/clm` (`src/viewer.ts`, `src/timeline.ts`) opens the panel; it never enters model
 context. `/clm <page>` opens a page directly, and outside the TUI the command prints that
 page as text. `/clm status` prints three lines (next request against the budget, edits,
-changed settings). Four pages:
+changed settings), and a fourth with the prefix-reuse FLOPs once a request is counted. Four pages:
 
 - **overview** — a bar chart of the provider-reported prompt size (excluding output)
   of every request on the branch (one column per request), the budget as a dashed
@@ -414,6 +434,7 @@ src/mirror-guard.ts          classify tool calls that read or write the mirror
 src/policy.ts                conservative-mode protection and pressure tiers
 src/budget.ts                CLM budget, tiers, notice text
 src/usage.ts                 prompt-only provider usage shared by calibration and timeline
+src/flops.ts                 prefix-reuse FLOPs accounting per request and per run
 src/observation.ts           per-tool-result cap in the effective context
 src/overflow.ts              overflow guard: withhold the oldest tool results above the limit
 src/steering.ts              steering document loading and prompt section

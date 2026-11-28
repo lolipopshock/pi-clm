@@ -30,6 +30,7 @@ import {
 	sideBySideRows,
 	type SideBySideRow,
 } from "./diff.ts";
+import { formatFlops } from "./flops.ts";
 import { selectContextVisibleMessages, selectProtectedMessageIndexes } from "./policy.ts";
 import { contextMode, formatCount } from "./presentation.ts";
 import { applyProjection, type ProjectionCheckpoint } from "./projection.ts";
@@ -2231,6 +2232,9 @@ export class LiveContextViewer implements Component {
 			latest ? `now ${formatCount(latest.tokens)}` : undefined,
 			latest ? `peak ${formatCount(timeline.peakTokens)}` : undefined,
 			this.model.budget !== undefined ? `budget ${formatCount(this.model.budget)}` : undefined,
+			timeline.flops && timeline.flops.flops !== null
+				? `${formatFlops(timeline.flops.flops)} prefix-reuse`
+				: undefined,
 		].filter(Boolean).join(" · ");
 		// Physical lines throughout, so the list budget below is exact.
 		const wrap = (line: string) => line ? wrapTextWithAnsi(line, width) : [""];

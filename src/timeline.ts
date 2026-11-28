@@ -8,11 +8,13 @@
  * - one point per completed assistant message with provider usage — the provider-reported
  *   prompt size of that request (input + cache, excluding generated output);
  * - one marker per `live-context-state` entry whose outcome was `applied` (an accepted
- *   context edit, with its recorded before/after estimate), `reset`, or a rejection.
+ *   context edit, with its recorded before/after estimate), `reset`, or a rejection;
+ * - the prefix-reuse FLOPs of each request, from its `pi-clm-flops` entry (`src/flops.ts`).
  *
  * Rendering is pure text so it can be unit-tested and reused by the non-TUI report.
  */
 
+import { formatFlops, isFlopsRequestRecord, PREFIX_REUSE_FLOPS_ENTRY, type FlopsRequestRecord, type FlopsTotals } from "./flops.ts";
 import type { LiveContextState, SessionEntryLike } from "./state.ts";
 import { isLiveContextState } from "./state.ts";
 import { promptTokens } from "./usage.ts";
@@ -27,6 +29,10 @@ export interface TimelinePoint {
 	outputTokens?: number;
 	/** Live-context revision active when the request was answered. */
 	revision: number;
+	/** Prefix-reuse FLOPs of this request, when recorded with model constants. */
+	flops?: number;
+	/** Prompt tokens reused from an earlier request's prefix, when recorded. */
+	reusedTokens?: number;
 }
 
 export interface TimelineMarker {
@@ -46,6 +52,8 @@ export interface ContextTimeline {
 	peakTokens: number;
 	/** Indices into `points` of the first request after each user message (turn landmarks). */
 	turnStarts?: number[];
+	/** Cumulative prefix-reuse accounting of the branch (the newest `pi-clm-flops` entry). */
+	flops?: FlopsTotals;
 }
 
 interface MessageEntryLike extends SessionEntryLike {
@@ -76,7 +84,12 @@ export function buildContextTimeline(entries: readonly SessionEntryLike[]): Cont
 	let pendingTurn = false;
 	let revision = 0;
 	let lastOutcomeAt: string | undefined;
+	const flopsRecords: FlopsRequestRecord[] = [];
 	for (const entry of entries) {
+		if (entry.type === "custom" && entry.customType === PREFIX_REUSE_FLOPS_ENTRY && isFlopsRequestRecord(entry.data)) {
+			flopsRecords.push(entry.data);
+			continue;
+		}
 		if (entry.type === "message") {
 			const message = (entry as MessageEntryLike).message;
 			if (message?.role === "user") pendingTurn = true;
@@ -111,7 +124,29 @@ export function buildContextTimeline(entries: readonly SessionEntryLike[]): Cont
 			});
 		}
 	}
-	return { points, markers, peakTokens: points.reduce((peak, point) => Math.max(peak, point.tokens), 0), turnStarts };
+	attachFlops(points, flopsRecords);
+	return {
+		points, markers, peakTokens: points.reduce((peak, point) => Math.max(peak, point.tokens), 0), turnStarts,
+		...(flopsRecords.length > 0 ? { flops: flopsRecords.at(-1)!.cumulative } : {}),
+	};
+}
+
+/**
+ * Pair each FLOPs record with its request: the point with the same response time, else the
+ * next unpaired point with the same prompt size (records written before their message entry).
+ */
+function attachFlops(points: TimelinePoint[], records: readonly FlopsRequestRecord[]): void {
+	let cursor = 0;
+	for (const record of records) {
+		if (record.kind === "compaction") continue; // summarization calls are not timeline requests
+		let index = record.at ? points.findIndex((point, i) => i >= cursor && point.at === record.at) : -1;
+		if (index < 0) index = points.findIndex((point, i) => i >= cursor && point.tokens === record.promptTokens);
+		if (index < 0) continue;
+		const point = points[index]!;
+		if (record.flops !== null) point.flops = record.flops;
+		point.reusedTokens = record.prefixMatch.reusedTokens;
+		cursor = index + 1;
+	}
 }
 
 export function formatTokenCount(value: number): string {
@@ -344,6 +379,8 @@ export function describeTimelineBucket(timeline: ContextTimeline, bucket: Timeli
 	const outputTokens = timeline.points.slice(bucket.first, bucket.last + 1)
 		.reduce((total, point) => total + (point.outputTokens ?? 0), 0);
 	if (outputTokens > 0) parts.push(`${formatTokenCount(outputTokens)} generated tok`);
+	const counted = timeline.points.slice(bucket.first, bucket.last + 1).filter((point) => point.flops !== undefined);
+	if (counted.length > 0) parts.push(`${formatFlops(counted.reduce((total, point) => total + point.flops!, 0))} prefix-reuse`);
 	if (bucket.turns > 0) parts.push(`${bucket.turns} user turn${bucket.turns === 1 ? "" : "s"}`);
 	if (bucket.edits.length > 0) parts.push(`${bucket.edits.length} accepted edit${bucket.edits.length === 1 ? "" : "s"}`);
 	return parts.join(" · ");
@@ -502,5 +539,15 @@ export function formatTimelineReport(timeline: ContextTimeline, width = 72, budg
 	const applied = timeline.markers.filter((marker) => marker.kind === "applied");
 	lines.push("", applied.length === 0 ? "No accepted context edits yet." : `${applied.length} accepted context edit${applied.length === 1 ? "" : "s"}:`);
 	for (const marker of timeline.markers) lines.push(`  ${formatMarkerRow(marker, timeline)}`);
+	const flops = timeline.flops;
+	if (flops && flops.requests > 0) {
+		lines.push(
+			"",
+			`Prefix-reuse compute: ${flops.flops === null ? "unavailable" : formatFlops(flops.flops)} (${flops.source.replaceAll("-", " ")}) over ${flops.requests} request${flops.requests === 1 ? "" : "s"}; ` +
+				`prefix match reused ${formatTokenCount(flops.prefixReusedTokens)} of ${formatTokenCount(flops.promptTokens)} prompt tokens` +
+				`${flops.serverCachedTokens !== null && flops.serverPositiveRequests > 0 ? `, the server cached ${formatTokenCount(flops.serverCachedTokens)}` : ""}; ` +
+				`${formatTokenCount(flops.outputTokens)} generated.`,
+		);
+	}
 	return lines.join("\n");
 }

@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { budgetPolicyFromEnv, estimateFactorFromEnv } from "./src/budget.ts";
 import { compactPromptFromEnv } from "./src/compact.ts";
+import { flopsConfigFromEnv } from "./src/flops.ts";
 import liveContextExtension from "./src/index.ts";
 import { observationCapFromEnv } from "./src/observation.ts";
 import { overflowGuardFromEnv } from "./src/overflow.ts";
@@ -30,6 +31,11 @@ import { steeringPathFromEnv } from "./src/steering.ts";
  * - PI_CLM_NATIVE_COMPACTION — "auto" (default): cancel Pi's threshold compaction while a
  *   budget is enforced by the overflow guard; "off": cancel all automatic compaction;
  *   "on": Pi default.
+ * - PI_CLM_FLOPS_MODEL / PI_CLM_FLOPS_PER_TOKEN / PI_CLM_FLOPS_PER_PAIR / PI_CLM_FLOPS_SOURCE —
+ *   prefix-reuse FLOPs accounting: model preset ("auto" from the model id, "27b", "9b", or
+ *   "off") or explicit constants, and the headline source ("auto": server cached tokens when
+ *   reported, else prefix match; "server"; "prefix"); recorded in session entries, never sent
+ *   to the model.
  */
 function flagFromEnv(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
 	const raw = env[name]?.trim().toLowerCase();
@@ -54,6 +60,7 @@ export default function clmExtension(pi: ExtensionAPI): void {
 		oneToolPerTurn: flagFromEnv("PI_CLM_ONE_TOOL_PER_TURN"),
 		sizeTrailer: flagFromEnv("PI_CLM_SIZE_TRAILER"),
 		compactPromptPath: compactPromptFromEnv(),
+		flops: flopsConfigFromEnv(),
 		banner: { enabled: true },
 	});
 }

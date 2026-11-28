@@ -46,6 +46,10 @@ saying which variable is wrong.
 | `PI_CLM_SIZE_TRAILER`       | `1`, `true`, `on` or `yes`; anything else is off                                 | `trailer`       |
 | `PI_CLM_COMPACT_PROMPT`     | a path to a markdown template; `default`, `none` or `off` for the built-in prompt | `compact-prompt` |
 | `PI_CLM_ESTIMATE_FACTOR`    | a number from 1 to 4: the prior for the size calibration (dense data: `2`)        | —               |
+| `PI_CLM_FLOPS_MODEL`        | `auto` (default), `27b`, `9b`, or `off` (no accounting)                          | —               |
+| `PI_CLM_FLOPS_PER_TOKEN`    | FLOPs per processed token, e.g. `48.7064e9`; with `PI_CLM_FLOPS_PER_PAIR`, overrides the preset | — |
+| `PI_CLM_FLOPS_PER_PAIR`     | FLOPs per attention query–key pair, e.g. `393216`; set together with the above    | —               |
+| `PI_CLM_FLOPS_SOURCE`       | `auto` (default: server cached tokens when reported, else prefix match), `server` or `prefix` | — |
 
 ## Notes
 
@@ -64,3 +68,78 @@ saying which variable is wrong.
   `/clm-compact` is always included.
 - **Parity switches** exist to compare with the paper's harness, which allows one tool call
   per turn and shows the context size in every observation. Leave them off for normal use.
+
+## Prefix-reuse FLOPs
+
+Every request's compute is recorded as prefix-reuse FLOPs, the cost measure of
+[Context Language Models](https://arxiv.org/abs/2609.37725) (appendix "Prefix-Reuse FLOPs
+Computation"; reference implementation in the
+[research codebase](https://github.com/facebookresearch/context-language-models/blob/main/clm/clm_harness/flops_metrics/kv_cache_flops.py)).
+At request *t* the prompt has *P* tokens and the model generates *G* (the provider's counts);
+*R* prompt tokens come from a reused prefix and *U = P − R* are prefilled. The request costs
+
+```text
+F = C_token · (U + G) + C_attn · ((P² − R²)/2 + G·P + G²/2)
+```
+
+and the run costs the sum. *R* is taken from two sources, and both are recorded for every
+request:
+
+- **server cached tokens** — the provider's count of prompt tokens served from its prefix
+  cache (`prompt_tokens_details.cached_tokens` on OpenAI-compatible servers, e.g. vLLM with
+  `--enable-prompt-tokens-details`; Pi's `cacheRead`).
+- **prefix match** — the longest run of leading prompt units (the tool definitions and system
+  fields, then each message) that also led an earlier request of the session. This mirrors
+  the research code's fallback (prefix matching over the reconstructed context) at message
+  granularity, with token weights from the provider's counts: a message's weight is fixed
+  where it first appears on a prompt path (the new messages of a request share its *U* in
+  proportion to their serialized length), so an append-only turn reuses exactly the previous
+  prompt. It does not depend on what the server kept in its cache, and it is always available.
+
+The headline follows the research code's priority: server cached tokens when every request so
+far reported them, otherwise the prefix match. Pi's OpenAI-compatible providers report a
+missing cache count as 0, so `auto` uses the server count only once some request reported a
+positive value. The server's count can be higher than the prefix match (on vLLM the previous reply's
+decoded tokens stay cached, which the prefix match counts as prefilled; other sessions on the
+same server can share a prefix) or lower (cache block granularity, coarse for hybrid-attention
+models; eviction).
+
+**Constants.** `C_token` is two FLOPs per non-embedding parameter; `C_attn` is
+4 × full-attention layers × query heads × head dimension. With `PI_CLM_FLOPS_MODEL=auto`
+(the default) a Qwen3.5-or-later model id that names a preset size picks it
+(`qwen3.6-27b`, `Qwen/Qwen3.8-27B` → `27b`); any other model gets token counts but no FLOPs
+until a preset or explicit constants are set.
+
+| preset | `C_token` | `C_attn` | models |
+|--------|-----------|----------|--------|
+| `27b`  | 2 × 24.3532e9 | 4 × 16 × 6144 | Qwen3.5/3.6-27B and later 27B models of that architecture |
+| `9b`   | 2 × 6.9196e9  | 4 × 8 × 4096  | Qwen3.5-9B |
+
+**Where it is recorded.**
+
+- `pi-clm-flops` session entry per request: `promptTokens`, `outputTokens`, `prefixMatch`
+  (`reusedTokens`, `newTokens`, `flops`), `serverCached` (`cachedTokens`, `newTokens`,
+  `flops`; null without a count), the headline `source` and `flops`, `constants`, and
+  `cumulative` totals for the branch so far (both sources; the server totals become null
+  once a request had no count). With `--mode json` each entry is also printed as an
+  `entry_appended` event.
+- `pi-clm-flops-summary` session entry at the end of every agent run: headline `source` and
+  `flops` and the branch totals, including `compaction` (see below).
+- `/clm status` (one extra line once a request is counted) and the **overview** page.
+
+**Pi's native compaction.** When Pi compacts the conversation itself (its threshold or
+overflow compaction, or `/compact`), it summarizes the history with a separate model call that
+does not pass through the request hooks. pi-clm counts that call from the usage Pi records on
+the compaction (`session_compact`): it is written as a `pi-clm-flops` entry with
+`kind: "compaction"` and included in the totals and the headline from that point on. Its
+reused prefix is 0 for the prefix match (a summarization prompt is a different prompt) and the
+cached tokens Pi reports for it for the server source (0 when absent). `totals.compaction`
+gives the summarization part separately (count, prompt and output tokens, FLOPs per source), so
+agent requests and summarization can be told apart. Pi reports the two calls of a split-turn
+summary as one usage, which makes the attention term an upper bound for those. A compaction
+whose usage is not reported is counted in `compaction.withoutUsage` and adds nothing.
+`/clm status` says how many summaries the totals include.
+
+Responses without a prompt count (failed or aborted requests) are not counted. Totals and
+reuse history are rebuilt from the entries on resume and `/tree`. The mirror never contains
+any of this.

@@ -202,3 +202,43 @@ describe("context timeline", () => {
 function detailBucket(timeline: ReturnType<typeof buildContextTimeline>) {
 	return layoutTimeline(timeline, { width: 40 }).buckets.at(-1)!;
 }
+
+describe("context timeline: prefix-reuse FLOPs", () => {
+	const flopsEntry = (request: number, promptTokens: number, flops: number | null, at?: number): SessionEntryLike => ({
+		type: "custom",
+		customType: "pi-clm-flops",
+		data: {
+			version: 1, request, ...(at !== undefined ? { at: new Date(at).toISOString() } : {}), units: 2, reusedUnits: 1,
+			promptTokens, outputTokens: 10,
+			prefixMatch: { reusedTokens: promptTokens - 1000, newTokens: 1000, flops: flops === null ? null : { linear: flops, attention: 0, total: flops } },
+			serverCached: null, source: "prefix-match", flops,
+			constants: null, prefixOf: null, newUnits: [],
+			cumulative: {
+				requests: request, promptTokens: 9000, outputTokens: 20, prefixReusedTokens: 4000, prefixNewTokens: 5000,
+				prefixMatchFlops: 3e15, prefixMatchLinearFlops: 3e15, prefixMatchAttentionFlops: 0,
+				serverCachedTokens: null, serverCachedFlops: null, serverCachedLinearFlops: null, serverCachedAttentionFlops: null,
+				serverPositiveRequests: 0, requestsWithoutFlops: 0, source: "prefix-match", flops: 3e15,
+			},
+		},
+	});
+
+	test("attaches each request's FLOPs by response time, or by prompt size when written before its message", () => {
+		const timeline = buildContextTimeline([
+			request(3000, 1_000),
+			flopsEntry(1, 3000, 1e15, 1_000),
+			flopsEntry(2, 6000, 2e15), // no time; written before its message entry
+			request(6000, 2_000),
+		]);
+		assert.deepEqual(timeline.points.map((point) => [point.flops, point.reusedTokens]), [[1e15, 2000], [2e15, 5000]]);
+		assert.equal(timeline.flops?.flops, 3e15);
+		const bucket = layoutTimeline(timeline, { width: 40, zoom: "fit", focusPoint: 1 }).buckets.at(-1)!;
+		assert.match(describeTimelineBucket(timeline, bucket), /PFLOP prefix-reuse/);
+		assert.match(formatTimelineReport(timeline), /Prefix-reuse compute: 3\.00 PFLOP \(prefix match\) over 2 requests; prefix match reused 4\.0k of 9\.0k prompt tokens; 20 generated\./);
+	});
+
+	test("a timeline without FLOPs entries reports nothing about compute", () => {
+		const timeline = buildContextTimeline([request(3000, 1_000)]);
+		assert.equal(timeline.flops, undefined);
+		assert.doesNotMatch(formatTimelineReport(timeline), /Prefix-reuse/);
+	});
+});
