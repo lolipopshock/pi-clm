@@ -342,7 +342,10 @@ the headline source follows `PI_CLM_FLOPS_SOURCE` (configuration.md). Each reque
 `pi-clm-flops` entry (with the trie nodes it added and which earlier request it extended, so
 `restore` can rebuild the trie on resume and `/tree`); `agent_end` appends a
 `pi-clm-flops-summary`. The timeline attaches each record to its request by response time,
-falling back to prompt size.
+falling back to prompt size. Pi's native compaction makes its summarization call outside the
+request hooks; `session_compact` carries its usage, which is added to the totals as a
+`kind: "compaction"` record (reused prefix 0 for the prefix match, the reported cache hits for
+the server source) and kept apart in `totals.compaction`.
 
 ## 8. Panel
 

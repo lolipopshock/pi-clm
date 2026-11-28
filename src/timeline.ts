@@ -138,6 +138,7 @@ export function buildContextTimeline(entries: readonly SessionEntryLike[]): Cont
 function attachFlops(points: TimelinePoint[], records: readonly FlopsRequestRecord[]): void {
 	let cursor = 0;
 	for (const record of records) {
+		if (record.kind === "compaction") continue; // summarization calls are not timeline requests
 		let index = record.at ? points.findIndex((point, i) => i >= cursor && point.at === record.at) : -1;
 		if (index < 0) index = points.findIndex((point, i) => i >= cursor && point.tokens === record.promptTokens);
 		if (index < 0) continue;

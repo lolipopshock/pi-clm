@@ -5,7 +5,6 @@ import {
 	FLOPS_PRESETS,
 	flopsConfigFromEnv,
 	formatFlops,
-	nativeCompactionStats,
 	PrefixReuseMeter,
 	promptUnits,
 	requestFlops,
@@ -222,29 +221,77 @@ test("environment parsing rejects malformed values", () => {
 	assert.throws(() => flopsConfigFromEnv({ PI_CLM_FLOPS_PER_TOKEN: "-1", PI_CLM_FLOPS_PER_PAIR: "1" }), /positive/);
 });
 
-test("native compactions are counted and estimated separately, never added to the headline", () => {
+test("native compaction summaries are counted in the totals and the headline, with a breakdown", () => {
+	const meter = new PrefixReuseMeter("auto");
+	const first = run(meter, [user], { input: 1000, cacheRead: 0, output: 5 });
+	const second = run(meter, [user, call(1), result(1)], { input: 300, cacheRead: 1000, output: 5 });
+	const before = { ...meter.totals };
+	const usage = { input: 27_680, cacheRead: 640, cacheWrite: 0, output: 2_443 };
+	const c = meter.observeCompaction(usage, { reason: "overflow", constants: Q27, at: "2026-01-01T00:00:00.000Z" });
+	assert.equal(c.kind, "compaction");
+	assert.equal(c.reason, "overflow");
+	assert.deepEqual([c.request, c.promptTokens, c.outputTokens, c.units, c.prefixOf], [3, 28_320, 2_443, 0, null]);
+	// Prefix match: a summarization prompt reuses nothing; server: the cached tokens it reported.
+	assert.equal(c.prefixMatch.reusedTokens, 0);
+	assert.equal(c.prefixMatch.flops!.total, requestFlops(Q27, { prompt: 28_320, reused: 0, output: 2_443 }).total);
+	assert.equal(c.serverCached!.cachedTokens, 640);
+	assert.equal(c.serverCached!.flops!.total, requestFlops(Q27, { prompt: 28_320, reused: 640, output: 2_443 }).total);
+	const after = meter.totals;
+	assert.equal(after.source, "server-cached-tokens");
+	assert.equal(after.flops! - before.flops!, c.serverCached!.flops!.total, "headline grows by exactly the compaction FLOPs");
+	assert.equal(after.prefixMatchFlops - before.prefixMatchFlops, c.prefixMatch.flops!.total);
+	assert.deepEqual([after.requests, after.promptTokens - before.promptTokens, after.outputTokens - before.outputTokens], [3, 28_320, 2_443]);
+	assert.deepEqual(after.compaction, {
+		count: 1, withoutUsage: 0, promptTokens: 28_320, outputTokens: 2_443, serverCachedTokens: 640,
+		prefixMatchFlops: c.prefixMatch.flops!.total, serverCachedFlops: c.serverCached!.flops!.total,
+	});
+	assert.deepEqual(meter.summary("t").totals.compaction, after.compaction);
+	assert.equal(meter.summary("t").flops, after.flops);
+	// Agent requests keep reusing their own prefixes; the summarization prompt is not in the trie.
+	const next = run(meter, [user, call(1), result(1), call(2)], { input: 100, cacheRead: 1300, output: 5 });
+	assert.equal(next.prefixMatch.reusedTokens, second.promptTokens);
+	assert.equal(next.request, 4);
+	assert.equal(next.cumulative.compaction.count, 1);
+	assert.equal(first.cumulative.compaction.count, 0);
+});
+
+test("a compaction without reported usage is counted as such and adds nothing", () => {
 	const meter = new PrefixReuseMeter();
 	run(meter, [user], { input: 1000, cacheRead: 0, output: 5 });
-	const entries = [
-		{ type: "message" },
-		{ type: "compaction", usage: { input: 28_000, cacheRead: 320, cacheWrite: 0, output: 2_443 } },
-		{ type: "custom" },
-		{ type: "compaction", usage: { input: 20_144, output: 7_407 } },
+	const before = { ...meter.totals };
+	const c = meter.observeCompaction(undefined, { reason: "threshold", constants: Q27 });
+	assert.equal(c.withoutUsage, true);
+	assert.equal(c.flops, null);
+	const { compaction, ...rest } = meter.totals;
+	const { compaction: compactionBefore, ...restBefore } = before;
+	assert.deepEqual(rest, restBefore);
+	assert.deepEqual([compaction.count, compaction.withoutUsage, compactionBefore.withoutUsage], [0, 1, 0]);
+});
+
+test("resume rebuilds the same totals from records that include compactions, without double counting", () => {
+	const live = new PrefixReuseMeter();
+	const records: FlopsRequestRecord[] = [
+		run(live, [user], { input: 1000, cacheRead: 0, output: 5 }),
+		run(live, [user, call(1), result(1)], { input: 800, cacheRead: 1000, output: 5 }),
+		live.observeCompaction({ input: 20_000, cacheRead: 0, output: 1_000 }, { reason: "overflow", constants: Q27 }),
+		live.observeCompaction(undefined, { reason: "overflow", constants: Q27 }),
+		run(live, [user, call(1), result(1), call(2)], { input: 300, cacheRead: 1800, output: 5 }),
 	];
-	const stats = nativeCompactionStats(entries, Q27);
-	assert.deepEqual([stats.count, stats.withUsage, stats.promptTokens, stats.outputTokens], [2, 2, 48_464, 9_850]);
-	assert.equal(
-		stats.estimatedFlops,
-		requestFlops(Q27, { prompt: 28_320, reused: 0, output: 2_443 }).total + requestFlops(Q27, { prompt: 20_144, reused: 0, output: 7_407 }).total,
-	);
-	const summary = meter.summary("t", stats);
-	assert.deepEqual(summary.nativeCompactions, stats);
-	assert.equal(summary.flops, meter.totals.flops); // headline unchanged
-	// No estimate without constants, or when a compaction carries no usage (counted, not estimated).
-	assert.equal(nativeCompactionStats(entries, null).estimatedFlops, null);
-	const partial = nativeCompactionStats([...entries, { type: "compaction" }], Q27);
-	assert.deepEqual([partial.count, partial.withUsage, partial.estimatedFlops], [3, 2, null]);
-	assert.deepEqual(meter.summary("t").nativeCompactions, { count: 0, withUsage: 0, promptTokens: 0, outputTokens: 0, estimatedFlops: null });
+	const restored = new PrefixReuseMeter();
+	restored.restore(JSON.parse(JSON.stringify(records)));
+	assert.deepEqual(restored.totals, live.totals);
+	assert.deepEqual([restored.totals.compaction.count, restored.totals.compaction.withoutUsage], [1, 1]);
+	// Restoring twice (e.g. /tree back and forth) gives the same totals again.
+	restored.restore(JSON.parse(JSON.stringify(records)));
+	assert.deepEqual(restored.totals, live.totals);
+	const next = [user, call(1), result(1), call(2), result(2)];
+	assert.deepEqual(run(restored, next, { input: 200, cacheRead: 2100, output: 5 }), run(live, next, { input: 200, cacheRead: 2100, output: 5 }));
+	// Records written before the breakdown existed restore with an empty one.
+	const old = JSON.parse(JSON.stringify(records[0]));
+	delete old.cumulative.compaction;
+	const legacy = new PrefixReuseMeter();
+	legacy.restore([old]);
+	assert.equal(legacy.totals.compaction.count, 0);
 });
 
 test("formatting", () => {

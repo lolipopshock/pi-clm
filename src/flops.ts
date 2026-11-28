@@ -35,9 +35,12 @@
  * split of one request's new tokens between its new messages is approximate.
  *
  * Pi's native compaction summarizes history with its own model call, which does not pass
- * through the request hooks: it is not in the per-request records or the totals. The run
- * summary counts the compactions on the branch and, when their usage is known, gives a
- * separately labelled estimate of their FLOPs (never added to the headline).
+ * through the request hooks. Its usage arrives with the compaction (`session_compact`) and is
+ * counted as one more request in the totals and the headline, from that point on: prefix-match
+ * R = 0 (a summarization prompt is a different prompt), server R = the cached tokens Pi reports
+ * for it (0 when absent). Pi reports the two calls of a split-turn summary as one usage, which
+ * makes the attention term an upper bound for those. `totals.compaction` keeps the
+ * summarization part separate; a compaction without usage is counted there, never guessed.
  *
  * Accounting only: nothing here changes a request.
  */
@@ -183,6 +186,24 @@ export interface FlopsTotals {
 	/** Headline: the source chosen by `PI_CLM_FLOPS_SOURCE` and its Σ F_t (null when unavailable). */
 	source: FlopsSource;
 	flops: number | null;
+	/** The part of the totals above that is Pi's native-compaction summarization. */
+	compaction: CompactionTotals;
+}
+
+export interface CompactionTotals {
+	/** Compactions counted (their usage is in the totals). */
+	count: number;
+	/** Compactions whose usage was not reported: not counted in any total. */
+	withoutUsage: number;
+	promptTokens: number;
+	outputTokens: number;
+	serverCachedTokens: number;
+	prefixMatchFlops: number;
+	serverCachedFlops: number;
+}
+
+export function emptyCompactionTotals(): CompactionTotals {
+	return { count: 0, withoutUsage: 0, promptTokens: 0, outputTokens: 0, serverCachedTokens: 0, prefixMatchFlops: 0, serverCachedFlops: 0 };
 }
 
 export function emptyFlopsTotals(): FlopsTotals {
@@ -191,6 +212,7 @@ export function emptyFlopsTotals(): FlopsTotals {
 		prefixReusedTokens: 0, prefixNewTokens: 0, prefixMatchFlops: 0, prefixMatchLinearFlops: 0, prefixMatchAttentionFlops: 0,
 		serverCachedTokens: 0, serverCachedFlops: 0, serverCachedLinearFlops: 0, serverCachedAttentionFlops: 0,
 		serverPositiveRequests: 0, requestsWithoutFlops: 0, source: "prefix-match", flops: 0,
+		compaction: emptyCompactionTotals(),
 	};
 }
 
@@ -206,6 +228,12 @@ export function headlineFlops(totals: FlopsTotals, mode: FlopsSourceMode): { sou
 /** One request, as persisted in a `pi-clm-flops` session entry. */
 export interface FlopsRequestRecord {
 	version: 1;
+	/** `compaction`: Pi's native-compaction summarization call (no prompt units, R from usage only). */
+	kind?: "request" | "compaction";
+	/** Compaction trigger (`threshold`, `overflow`, `manual`), for `kind: "compaction"`. */
+	reason?: string;
+	/** For `kind: "compaction"`: true when Pi reported no usage (nothing added to the totals). */
+	withoutUsage?: boolean;
 	/** 1-based request number on this branch. */
 	request: number;
 	/** Response time (the assistant message's timestamp), ISO. */
@@ -231,22 +259,6 @@ export interface FlopsRequestRecord {
 	newUnits: [string, number][];
 }
 
-export interface NativeCompactionStats {
-	/** Pi compaction entries on the branch (their summarization calls are not in the totals). */
-	count: number;
-	/** Those whose entry carries the summarization call's provider usage. */
-	withUsage: number;
-	promptTokens: number;
-	outputTokens: number;
-	/**
-	 * Estimate, not part of `flops`: each summarization prompt counted as a fresh prefill
-	 * (no reuse) plus its output, with the run's constants. Pi reports a split turn's two calls
-	 * as one usage, which makes the attention term an upper bound for those. Null without
-	 * constants or when some compaction has no usage.
-	 */
-	estimatedFlops: number | null;
-}
-
 export interface FlopsSummaryRecord {
 	version: 1;
 	metric: "prefix-reuse FLOPs";
@@ -258,29 +270,6 @@ export interface FlopsSummaryRecord {
 	constants: FlopsConstants | null;
 	/** Assistant responses that reported no prompt usage (failed or aborted requests); not counted. */
 	unmeasuredResponses: number;
-	/** Pi's native compactions on the branch: counted and estimated separately, not in `flops`. */
-	nativeCompactions: NativeCompactionStats;
-}
-
-/** Pi `compaction` entries of a branch, with the estimate described in `NativeCompactionStats`. */
-export function nativeCompactionStats(
-	entries: readonly { type?: string; usage?: ResponseUsage }[],
-	constants: Pick<FlopsConstants, "perToken" | "perAttentionPair"> | null,
-): NativeCompactionStats {
-	const stats: NativeCompactionStats = { count: 0, withUsage: 0, promptTokens: 0, outputTokens: 0, estimatedFlops: 0 };
-	for (const entry of entries) {
-		if (entry.type !== "compaction") continue;
-		stats.count += 1;
-		const prompt = promptTokens(entry.usage);
-		if (prompt <= 0) continue;
-		const output = Math.max(0, entry.usage?.output ?? 0);
-		stats.withUsage += 1;
-		stats.promptTokens += prompt;
-		stats.outputTokens += output;
-		if (constants) stats.estimatedFlops! += requestFlops(constants, { prompt, reused: 0, output }).total;
-	}
-	if (!constants || stats.withUsage < stats.count) stats.estimatedFlops = null;
-	return stats;
 }
 
 interface TrieNode {
@@ -368,6 +357,11 @@ export class PrefixReuseMeter {
 	restore(records: readonly FlopsRequestRecord[]): void {
 		this.reset();
 		for (const record of records) {
+			if (record.kind === "compaction") {
+				this.totals = withCompactionDefaults(record.cumulative);
+				if (record.constants) this.lastConstants = record.constants;
+				continue;
+			}
 			let base = record.prefixOf ? (this.unitsByRequest.get(record.prefixOf) ?? []).slice(0, record.reusedUnits) : [];
 			if (base.length !== record.reusedUnits) base = []; // prefix source missing: keep totals, drop that reuse history
 			let node = this.root;
@@ -376,7 +370,7 @@ export class PrefixReuseMeter {
 				for (const [key, weight] of record.newUnits) node = this.child(node, key, weight, record.request);
 				this.unitsByRequest.set(record.request, [...base, ...record.newUnits.map(([key]) => key)]);
 			}
-			this.totals = { ...record.cumulative };
+			this.totals = withCompactionDefaults(record.cumulative);
 			this.lastConstants = record.constants;
 		}
 	}
@@ -437,6 +431,7 @@ export class PrefixReuseMeter {
 		const serverValid = before.serverCachedFlops !== null && cached !== undefined;
 		const add = (total: number | null, part: number | undefined) => (total === null || !serverValid ? null : total + (part ?? 0));
 		const totals: FlopsTotals = {
+			compaction: { ...before.compaction },
 			requests: request,
 			promptTokens: before.promptTokens + prompt,
 			outputTokens: before.outputTokens + output,
@@ -472,13 +467,77 @@ export class PrefixReuseMeter {
 			source: totals.source,
 			flops: requestHeadline ?? null,
 			constants,
-			cumulative: { ...totals },
+			cumulative: { ...totals, compaction: { ...totals.compaction } },
 			prefixOf: matchedUnits > 0 ? prefixOf : null,
 			newUnits,
 		};
 	}
 
-	summary(at = new Date().toISOString(), nativeCompactions: NativeCompactionStats = nativeCompactionStats([], null)): FlopsSummaryRecord {
+	/**
+	 * Account a native-compaction summarization call from its reported usage (see the module
+	 * comment). Returns the record to persist; without usage, the record only counts it.
+	 */
+	observeCompaction(usage: ResponseUsage | undefined, details: { reason?: string; model?: string; at?: string; constants: FlopsConstants | undefined }): FlopsRequestRecord {
+		const prompt = promptTokens(usage);
+		const output = Math.max(0, usage?.output ?? 0);
+		const before = this.totals;
+		const constants = details.constants ?? null;
+		const meta = {
+			version: 1 as const, kind: "compaction" as const, ...(details.reason ? { reason: details.reason } : {}),
+			...(details.at ? { at: details.at } : {}), ...(details.model ? { model: details.model } : {}),
+			units: 0, reusedUnits: 0, prefixOf: null, newUnits: [] as [string, number][], constants,
+		};
+		if (prompt <= 0) {
+			this.totals = { ...before, compaction: { ...before.compaction, withoutUsage: before.compaction.withoutUsage + 1 } };
+			return {
+				...meta, withoutUsage: true, request: before.requests, promptTokens: 0, outputTokens: 0,
+				prefixMatch: { reusedTokens: 0, newTokens: 0, flops: null }, serverCached: null,
+				source: this.totals.source, flops: null, cumulative: { ...this.totals, compaction: { ...this.totals.compaction } },
+			};
+		}
+		const cached = typeof usage?.cacheRead === "number" && Number.isFinite(usage.cacheRead) ? Math.max(0, Math.min(usage.cacheRead, prompt)) : 0;
+		const prefixCost = constants ? requestFlops(constants, { prompt, reused: 0, output }) : null;
+		const serverCost = constants ? requestFlops(constants, { prompt, reused: cached, output }) : null;
+		const request = before.requests + 1;
+		const plus = (total: number | null, part: number | undefined) => (total === null ? null : total + (part ?? 0));
+		const totals: FlopsTotals = {
+			...before,
+			requests: request,
+			promptTokens: before.promptTokens + prompt,
+			outputTokens: before.outputTokens + output,
+			prefixNewTokens: before.prefixNewTokens + prompt,
+			prefixMatchFlops: before.prefixMatchFlops + (prefixCost?.total ?? 0),
+			prefixMatchLinearFlops: before.prefixMatchLinearFlops + (prefixCost?.linear ?? 0),
+			prefixMatchAttentionFlops: before.prefixMatchAttentionFlops + (prefixCost?.attention ?? 0),
+			serverCachedTokens: plus(before.serverCachedTokens, cached),
+			serverCachedFlops: plus(before.serverCachedFlops, serverCost?.total),
+			serverCachedLinearFlops: plus(before.serverCachedLinearFlops, serverCost?.linear),
+			serverCachedAttentionFlops: plus(before.serverCachedAttentionFlops, serverCost?.attention),
+			requestsWithoutFlops: before.requestsWithoutFlops + (constants ? 0 : 1),
+			compaction: {
+				...before.compaction,
+				count: before.compaction.count + 1,
+				promptTokens: before.compaction.promptTokens + prompt,
+				outputTokens: before.compaction.outputTokens + output,
+				serverCachedTokens: before.compaction.serverCachedTokens + cached,
+				prefixMatchFlops: before.compaction.prefixMatchFlops + (prefixCost?.total ?? 0),
+				serverCachedFlops: before.compaction.serverCachedFlops + (serverCost?.total ?? 0),
+			},
+		};
+		Object.assign(totals, headlineFlops(totals, this.mode));
+		this.totals = totals;
+		if (constants) this.lastConstants = constants;
+		return {
+			...meta, request, promptTokens: prompt, outputTokens: output,
+			prefixMatch: { reusedTokens: 0, newTokens: prompt, flops: prefixCost },
+			serverCached: { cachedTokens: cached, newTokens: prompt - cached, flops: serverCost },
+			source: totals.source,
+			flops: (totals.source === "server-cached-tokens" ? serverCost?.total : prefixCost?.total) ?? null,
+			cumulative: { ...totals, compaction: { ...totals.compaction } },
+		};
+	}
+
+	summary(at = new Date().toISOString()): FlopsSummaryRecord {
 		return {
 			version: 1,
 			metric: "prefix-reuse FLOPs",
@@ -488,7 +547,6 @@ export class PrefixReuseMeter {
 			totals: { ...this.totals },
 			constants: this.lastConstants,
 			unmeasuredResponses: this.unmeasuredResponses,
-			nativeCompactions,
 		};
 	}
 
@@ -500,6 +558,11 @@ export class PrefixReuseMeter {
 		}
 		return next;
 	}
+}
+
+/** Totals from records written before `compaction` existed get an empty breakdown. */
+function withCompactionDefaults(totals: FlopsTotals): FlopsTotals {
+	return { ...totals, compaction: { ...emptyCompactionTotals(), ...(totals.compaction ?? {}) } };
 }
 
 export function isFlopsRequestRecord(value: unknown): value is FlopsRequestRecord {

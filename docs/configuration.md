@@ -124,18 +124,21 @@ until a preset or explicit constants are set.
   once a request had no count). With `--mode json` each entry is also printed as an
   `entry_appended` event.
 - `pi-clm-flops-summary` session entry at the end of every agent run: headline `source` and
-  `flops`, the branch totals, and `nativeCompactions` (see below).
+  `flops` and the branch totals, including `compaction` (see below).
 - `/clm status` (one extra line once a request is counted) and the **overview** page.
 
 **Pi's native compaction.** When Pi compacts the conversation itself (its threshold or
 overflow compaction, or `/compact`), it summarizes the history with a separate model call that
-does not pass through the request hooks, so that call is not in the per-request records or the
-totals. The run summary reports it apart from the totals: `nativeCompactions.count` (compaction
-entries on the branch), their provider usage (`promptTokens`, `outputTokens`) and
-`estimatedFlops`, an estimate that counts each summarization prompt as a fresh prefill without
-reuse (Pi reports the two calls of a split turn as one usage, so the attention term is an upper
-bound for those) and is never added to `flops`. `/clm status` notes how many compactions are
-not included.
+does not pass through the request hooks. pi-clm counts that call from the usage Pi records on
+the compaction (`session_compact`): it is written as a `pi-clm-flops` entry with
+`kind: "compaction"` and included in the totals and the headline from that point on. Its
+reused prefix is 0 for the prefix match (a summarization prompt is a different prompt) and the
+cached tokens Pi reports for it for the server source (0 when absent). `totals.compaction`
+gives the summarization part separately (count, prompt and output tokens, FLOPs per source), so
+agent requests and summarization can be told apart. Pi reports the two calls of a split-turn
+summary as one usage, which makes the attention term an upper bound for those. A compaction
+whose usage is not reported is counted in `compaction.withoutUsage` and adds nothing.
+`/clm status` says how many summaries the totals include.
 
 Responses without a prompt count (failed or aborted requests) are not counted. Totals and
 reuse history are rebuilt from the entries on resume and `/tree`. The mirror never contains

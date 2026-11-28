@@ -1847,15 +1847,21 @@ describe("pi-clm entry point", () => {
 			await request([user], { input: 1000, cacheRead: 0, cacheWrite: 0, output: 100 }, 1_000);
 			await request([user, call, toolResult], { input: 300, cacheRead: 1000, cacheWrite: 0, output: 50 }, 2_000);
 			await emit(harness, "message_end", { type: "message_end", message: { role: "toolResult", content: [] } });
-			// A native Pi compaction on the branch: its summarization call never reaches the request hooks.
-			harness.branch.push({
-				type: "compaction", id: "compaction-1", parentId: harness.branch.at(-1)?.id ?? null, timestamp: new Date().toISOString(),
+			// A native Pi compaction: its summarization call never reaches the request hooks, so it is
+			// counted from the usage on the compaction entry.
+			const compactionEntry = {
+				type: "compaction", id: "compaction-1", parentId: harness.branch.at(-1)?.id ?? null, timestamp: new Date(2_500).toISOString(),
 				summary: "s", firstKeptEntryId: "x", tokensBefore: 50_000, usage: { input: 20_000, output: 1_000, cacheRead: 0, cacheWrite: 0, totalTokens: 21_000 },
-			});
+			};
+			harness.branch.push(compactionEntry);
+			await emit(harness, "session_compact", { type: "session_compact", compactionEntry, fromExtension: false, reason: "overflow", willRetry: true });
 			await emit(harness, "agent_end", { type: "agent_end", messages: [] });
 
-			const records = harness.branch.filter((entry) => entry.customType === "pi-clm-flops").map((entry) => entry.data);
-			assert.equal(records.length, 2);
+			const allRecords = harness.branch.filter((entry) => entry.customType === "pi-clm-flops").map((entry) => entry.data);
+			assert.equal(allRecords.length, 3);
+			const compaction = allRecords[2];
+			assert.deepEqual([compaction.kind, compaction.reason, compaction.promptTokens, compaction.outputTokens], ["compaction", "overflow", 20_000, 1_000]);
+			const records = allRecords.slice(0, 2);
 			assert.deepEqual(
 				records.map((r: any) => [r.request, r.promptTokens, r.prefixMatch.reusedTokens, r.prefixMatch.newTokens, r.outputTokens, r.serverCached.cachedTokens]),
 				[[1, 1000, 0, 1000, 100, 0], [2, 1300, 1000, 300, 50, 1000]],
@@ -1864,18 +1870,18 @@ describe("pi-clm entry point", () => {
 			// The server reported its cache hits on every request: the headline uses them.
 			assert.equal(records[1].cumulative.source, "server-cached-tokens");
 			assert.equal(records[1].cumulative.flops, records[0].serverCached.flops.total + records[1].serverCached.flops.total);
+			assert.equal(records[1].cumulative.compaction.count, 0);
 			assert.equal(records[1].cumulative.prefixMatchFlops, records[0].prefixMatch.flops.total + records[1].prefixMatch.flops.total);
 			const summary = harness.branch.filter((entry) => entry.customType === "pi-clm-flops-summary").map((entry) => entry.data);
 			assert.equal(summary.length, 1);
 			assert.equal(summary[0].source, "server-cached-tokens");
-			assert.equal(summary[0].flops, records[1].cumulative.flops);
 			assert.equal(summary[0].constants.source, "27b");
-			assert.deepEqual([summary[0].nativeCompactions.count, summary[0].nativeCompactions.promptTokens, summary[0].nativeCompactions.outputTokens], [1, 20_000, 1_000]);
-			assert.ok(summary[0].nativeCompactions.estimatedFlops > 0);
-			assert.equal(summary[0].flops, records[1].cumulative.flops, "the compaction estimate stays out of the headline");
+			assert.equal(summary[0].flops, records[1].cumulative.flops + compaction.serverCached.flops.total, "the summarization call is in the headline");
+			assert.deepEqual([summary[0].totals.compaction.count, summary[0].totals.compaction.promptTokens, summary[0].totals.requests], [1, 20_000, 3]);
 
 			await harness.commands.get("clm").handler("status", harness.ctx);
-			assert.match(harness.notifications.at(-1)!, /prefix-reuse [0-9.]+ [PT]FLOP \(server cached tokens\) over 2 requests · prefix match [0-9.]+ [PT]FLOP · prompt 2\.3k tok: 1k reused by prefix match, 1k cached by the server · 1 native compaction not included$/);
+			const status = harness.notifications.at(-1)!;
+			assert.match(status, /prefix-reuse [0-9.]+ [PT]FLOP \(server cached tokens\) over 3 requests · prefix match [0-9.]+ [PT]FLOP · prompt 22\.3k tok: 1k reused by prefix match, 1k cached by the server · includes 1 native compaction summary$/);
 
 			// Resume: totals and reuse history come back from the session entries.
 			const resumed = createHarness([...harness.branch]);
@@ -1884,6 +1890,9 @@ describe("pi-clm entry point", () => {
 			resumed.ctx.getSystemPrompt = () => "";
 			await emit(resumed, "session_start", { reason: "resume" });
 			try {
+				// Same totals after resume (no double counting of the compaction).
+				await resumed.commands.get("clm").handler("status", resumed.ctx);
+				assert.equal(resumed.notifications.at(-1)!.split("\n").at(-1), status.split("\n").at(-1));
 				await emit(resumed, "before_provider_request", {
 					type: "before_provider_request",
 					payload: { model: "qwen3.6-27b", messages: [user, call, toolResult, { role: "assistant", content: "done" }], tools: [{ type: "function", function: { name: "search" } }], max_tokens: 4096 },
@@ -1893,7 +1902,7 @@ describe("pi-clm entry point", () => {
 					message: { role: "assistant", content: [], usage: { input: 1400, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { total: 0 } }, stopReason: "stop", timestamp: 3_000 },
 				});
 				const third = resumed.branch.filter((entry) => entry.customType === "pi-clm-flops").at(-1)!.data;
-				assert.deepEqual([third.request, third.prefixMatch.reusedTokens, third.cumulative.requests], [3, 1300, 3]);
+				assert.deepEqual([third.request, third.prefixMatch.reusedTokens, third.cumulative.requests, third.cumulative.compaction.count], [4, 1300, 4, 1]);
 			} finally { await emit(resumed, "session_shutdown", {}); }
 		} finally { await emit(harness, "session_shutdown", {}); }
 	});
